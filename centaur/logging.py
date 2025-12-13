@@ -55,5 +55,42 @@ class Logger:
         status: str,
     ) -> None:
         """
-        Log the standard per-module su
+        Log the standard per-module summary block.
+        Always emitted (unless logging is globally disabled).
+        """
+        if not self._config.enabled:
+            return
 
+        self._print_header(module, file)
+        print(f"  {read}/{expected} read | {written}/{expected} written | {status}")
+
+    def log_failure(
+        self,
+        module: str,
+        file: str,
+        *,
+        action: str,
+        reason: str,
+    ) -> None:
+        """
+        Log a module failure and the configured action taken.
+        """
+        if not self._config.enabled:
+            return
+
+        self._print_header(module, file)
+        print(f"  FAILED | action={action} | reason={reason}")
+
+    def log_verbose_fields(
+        self,
+        module: str,
+        fields: Dict[str, Any],
+    ) -> None:
+        """
+        Log verbose per-field output for a module, if enabled.
+        """
+        if not self._config.is_verbose(module):
+            return
+
+        for key, value in fields.items():
+            print(f"    {key}={value}")
