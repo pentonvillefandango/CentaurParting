@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+# SQLite database (contains local / sensitive data)
+*.db
+*.sqlite
+*.sqlite3
+
