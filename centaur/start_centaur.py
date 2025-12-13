@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from queue import Empty
+from typing import List, Tuple
 
 from centaur.config import default_config
 from centaur.init_db import init_db
@@ -33,6 +34,8 @@ def main() -> None:
     modules_ok_total = 0
     modules_failed_total = 0
 
+    failed_items_all: List[Tuple[str, str]] = []  # (module_name, file_path)
+
     print("Centaur Parting running. Ctrl+C to stop.\n")
 
     try:
@@ -49,6 +52,9 @@ def main() -> None:
             modules_skipped_total += per_event.skipped
             modules_ok_total += per_event.ok
             modules_failed_total += per_event.failed
+
+            if per_event.failed_items:
+                failed_items_all.extend(per_event.failed_items)
 
             if ready_total % 10 == 0:
                 print(
@@ -73,6 +79,14 @@ def main() -> None:
             f"failed={modules_failed_total} "
             f"skipped={modules_skipped_total}\n"
         )
+
+        if failed_items_all:
+            print(f"FAILED MODULES ({len(failed_items_all)}):")
+            for module_name, file_path in failed_items_all[-20:]:
+                print(f"  {module_name} :: {file_path}")
+            if len(failed_items_all) > 20:
+                print(f"  ... (showing last 20 of {len(failed_items_all)})")
+            print("")
 
 
 if __name__ == "__main__":

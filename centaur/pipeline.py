@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Optional, Tuple, List
 
 from centaur.config import AppConfig
 from centaur.logging import Logger
@@ -16,6 +16,7 @@ class PipelineResult:
     skipped: int = 0
     ok: int = 0
     failed: int = 0
+    failed_items: List[Tuple[str, str]] = field(default_factory=list)  # (module_name, file_path)
 
 
 def build_worker_registry() -> Dict[str, WorkerFn]:
@@ -52,6 +53,7 @@ def run_pipeline_for_event(
 
         if worker_result is False:
             result.failed += 1
+            result.failed_items.append((module_name, str(event.file_path)))
         else:
             result.ok += 1
 
