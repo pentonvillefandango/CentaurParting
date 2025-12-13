@@ -21,20 +21,16 @@ class PipelineResult:
 def build_worker_registry() -> Dict[str, WorkerFn]:
     """
     Central registry of pipeline workers.
-
-    To add a new module later:
-    1) create centaur/<new_worker>.py
-    2) import its process function here
-    3) add ONE line to this dict
-    4) flip enabled_modules in config
     """
     from centaur.fits_header_worker import process_file_event as fits_header_process
     from centaur.sky_basic_worker import process_file_event as sky_basic_process
+    from centaur.sky_background2d_worker import process_file_event as sky_bkg2d_process
 
     return {
         # Order matters: fits header first so image_id exists for later modules.
         "fits_header_worker": fits_header_process,
         "sky_basic_worker": sky_basic_process,
+        "sky_background2d_worker": sky_bkg2d_process,
     }
 
 

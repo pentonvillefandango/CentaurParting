@@ -8,6 +8,7 @@ from centaur.logging import Logger
 from centaur.watcher import Watcher
 from centaur.pipeline import build_worker_registry, run_pipeline_for_event
 from centaur.schema_sky_basic import ensure_sky_basic_schema
+from centaur.schema_sky_background2d import ensure_sky_background2d_schema
 
 
 def main() -> None:
@@ -17,8 +18,9 @@ def main() -> None:
     # Base schema (safe to run repeatedly)
     init_db(cfg.db_path)
 
-    # Sky Basic schema add-on (safe to run repeatedly)
+    # Schema add-ons (safe to run repeatedly)
     ensure_sky_basic_schema(cfg.db_path)
+    ensure_sky_background2d_schema(cfg.db_path)
 
     watcher = Watcher(cfg, logger)
     watcher.start()
