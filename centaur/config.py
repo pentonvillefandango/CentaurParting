@@ -50,7 +50,7 @@ class AppConfig:
     enabled_modules: Dict[str, bool] = field(
         default_factory=lambda: {
             "fits_header_worker": True,
-            "sky_metrics_worker": False,
+            "sky_basic_worker": True,
             "psf_metrics_worker": False,
         }
     )
@@ -73,7 +73,8 @@ def default_config() -> AppConfig:
         logging=LoggingConfig(
             enabled=True,
             module_verbosity={
-                # Example: "fits_header_worker": True
+                "fits_header_worker": False, 
+                "sky_basic_worker": False,# Example: "fits_header_worker": True
             },
         ),
     )

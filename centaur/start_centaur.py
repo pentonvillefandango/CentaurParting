@@ -7,21 +7,24 @@ from centaur.init_db import init_db
 from centaur.logging import Logger
 from centaur.watcher import Watcher
 from centaur.pipeline import build_worker_registry, run_pipeline_for_event
+from centaur.schema_sky_basic import ensure_sky_basic_schema
 
 
 def main() -> None:
     cfg = default_config()
     logger = Logger(cfg.logging)
 
-    # Safe to run repeatedly
+    # Base schema (safe to run repeatedly)
     init_db(cfg.db_path)
+
+    # Sky Basic schema add-on (safe to run repeatedly)
+    ensure_sky_basic_schema(cfg.db_path)
 
     watcher = Watcher(cfg, logger)
     watcher.start()
 
     registry = build_worker_registry()
 
-    # Running totals
     ready_total = 0
     modules_enabled_total = 0
     modules_skipped_total = 0
