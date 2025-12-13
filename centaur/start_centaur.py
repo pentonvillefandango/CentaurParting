@@ -10,6 +10,9 @@ from centaur.watcher import Watcher
 from centaur.pipeline import build_worker_registry, run_pipeline_for_event
 from centaur.schema_sky_basic import ensure_sky_basic_schema
 from centaur.schema_sky_background2d import ensure_sky_background2d_schema
+from centaur.schema_camera_constants import ensure_camera_constants_schema
+from centaur.schema_exposure_advice import ensure_exposure_advice_schema
+from centaur.seed_camera_constants import seed_camera_constants
 
 
 def main() -> None:
@@ -22,6 +25,11 @@ def main() -> None:
     # Schema add-ons (safe to run repeatedly)
     ensure_sky_basic_schema(cfg.db_path)
     ensure_sky_background2d_schema(cfg.db_path)
+    ensure_camera_constants_schema(cfg.db_path)
+    ensure_exposure_advice_schema(cfg.db_path)
+    seed_camera_constants()
+
+
 
     watcher = Watcher(cfg, logger)
     watcher.start()

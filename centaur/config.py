@@ -51,7 +51,8 @@ class AppConfig:
         default_factory=lambda: {
             "fits_header_worker": True,
             "sky_basic_worker": True,
-             "sky_background2d_worker": True,       }
+            "exposure_advice_worker": True,
+            "sky_background2d_worker": True,       }
     )
 
     def is_module_enabled(self, module_name: str) -> bool:
@@ -74,6 +75,7 @@ def default_config() -> AppConfig:
             module_verbosity={
                 "fits_header_worker": False, 
                 "sky_basic_worker": False,# Example: "fits_header_worker": True
+                "exposure_advice_worker": False,
                 "sky_background2d_worker": False,
             },
         ),

@@ -22,16 +22,23 @@ class PipelineResult:
 def build_worker_registry() -> Dict[str, WorkerFn]:
     """
     Central registry of pipeline workers.
+    Order matters.
     """
     from centaur.fits_header_worker import process_file_event as fits_header_process
     from centaur.sky_basic_worker import process_file_event as sky_basic_process
     from centaur.sky_background2d_worker import process_file_event as sky_bkg2d_process
+    from centaur.exposure_advice_worker import process_file_event as exposure_advice_process
 
     return {
-        # Order matters: fits header first so image_id exists for later modules.
+        # Must run first so image_id exists and header tables are populated.
         "fits_header_worker": fits_header_process,
+
+        # Sky metrics
         "sky_basic_worker": sky_basic_process,
         "sky_background2d_worker": sky_bkg2d_process,
+
+        # Decision layer (Module0)
+        "exposure_advice_worker": exposure_advice_process,
     }
 
 
