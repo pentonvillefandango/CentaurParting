@@ -3,25 +3,30 @@ from __future__ import annotations
 from queue import Empty
 
 from centaur.config import default_config
-from centaur.fits_header_worker import process_file_event
 from centaur.init_db import init_db
 from centaur.logging import Logger
 from centaur.watcher import Watcher
+from centaur.pipeline import build_worker_registry, run_pipeline_for_event
 
 
 def main() -> None:
     cfg = default_config()
     logger = Logger(cfg.logging)
 
+    # Safe to run repeatedly
     init_db(cfg.db_path)
 
     watcher = Watcher(cfg, logger)
     watcher.start()
 
-    seen_ready = 0
-    processed_ok = 0
-    processed_failed = 0
-    skipped = 0
+    registry = build_worker_registry()
+
+    # Running totals
+    ready_total = 0
+    modules_enabled_total = 0
+    modules_skipped_total = 0
+    modules_ok_total = 0
+    modules_failed_total = 0
 
     print("Centaur Parting running. Ctrl+C to stop.\n")
 
@@ -32,28 +37,22 @@ def main() -> None:
             except Empty:
                 continue
 
-            seen_ready += 1
+            ready_total += 1
 
-            if cfg.is_module_enabled("fits_header_worker"):
-                result = process_file_event(cfg, logger, event)
+            per_event = run_pipeline_for_event(cfg, logger, event, registry)
+            modules_enabled_total += per_event.enabled
+            modules_skipped_total += per_event.skipped
+            modules_ok_total += per_event.ok
+            modules_failed_total += per_event.failed
 
-                # IMPORTANT:
-                # - Older workers return None (meaning: no explicit success/fail signal)
-                # - We treat None as success because the worker already logs OK/FAILED
-                if result is False:
-                    processed_failed += 1
-                else:
-                    processed_ok += 1
-            else:
-                skipped += 1
-
-            if seen_ready % 10 == 0:
+            if ready_total % 10 == 0:
                 print(
                     f"\nTOTALS: "
-                    f"ready={seen_ready} "
-                    f"ok={processed_ok} "
-                    f"failed={processed_failed} "
-                    f"skipped={skipped}\n"
+                    f"ready={ready_total} "
+                    f"modules_enabled={modules_enabled_total} "
+                    f"ok={modules_ok_total} "
+                    f"failed={modules_failed_total} "
+                    f"skipped={modules_skipped_total}\n"
                 )
 
     except KeyboardInterrupt:
@@ -63,10 +62,11 @@ def main() -> None:
         watcher.stop()
         print(
             f"\nFINAL TOTALS: "
-            f"ready={seen_ready} "
-            f"ok={processed_ok} "
-            f"failed={processed_failed} "
-            f"skipped={skipped}\n"
+            f"ready={ready_total} "
+            f"modules_enabled={modules_enabled_total} "
+            f"ok={modules_ok_total} "
+            f"failed={modules_failed_total} "
+            f"skipped={modules_skipped_total}\n"
         )
 
 
