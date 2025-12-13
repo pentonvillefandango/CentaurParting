@@ -94,6 +94,7 @@ class _Transaction:
         self._db = db
 
     def __enter__(self) -> Database:
+        self._db.connect()
         # BEGIN IMMEDIATE helps avoid deadlocks and makes "who owns the write lock" explicit
         self._db.execute("BEGIN IMMEDIATE;")
         return self._db
