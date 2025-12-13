@@ -66,6 +66,7 @@ def default_config() -> AppConfig:
     """
     return AppConfig(
         watch_roots=[
+            WatchRoot(Path("/Users/admin/Documents/Windowsshared/Astro_Data/Rig24"),"Rig24")
             # Example (edit this)
             # WatchRoot(Path("/Volumes/NAS/rig1/captures"), "Rig1 NAS"),
         ],

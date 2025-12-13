@@ -1,6 +1,6 @@
+
 from __future__ import annotations
 
-import os
 import threading
 import time
 from dataclasses import dataclass
@@ -27,9 +27,8 @@ class Watcher:
     """
     Watches one or more folders for new FITS files.
 
-    Key behaviors:
-    - Can ignore existing files on start (default)
-    - Optional backfill
+    Behaviors:
+    - Ignore existing files on start (default) unless allow_backfill=True
     - File stability check: size/mtime unchanged for N seconds
     - Runs in a background thread, stoppable (GUI-friendly)
     - Emits FileReadyEvent objects into an output queue
@@ -58,35 +57,42 @@ class Watcher:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-        # Track files we have already seen to avoid re-processing
+        # Track files already seen (prevents re-processing when allow_backfill=False)
         self._seen: Set[Path] = set()
 
     def start(self) -> None:
+        # Prevent accidental double-start
         if self._thread and self._thread.is_alive():
             return
 
         self._stop_event.clear()
 
-        # Seed initial state
+        # Seed initial state (ignore existing files)
         if self._config.ignore_existing_on_start and not self._config.allow_backfill:
             self._seed_seen_from_existing()
             self._logger.log_module_summary(
                 module="watcher",
                 file="(startup)",
-                expected=1,
+                expected_read=1,
                 read=1,
+                expected_written=1,
                 written=1,
                 status="Seeded ignore-existing set",
             )
 
-        self._thread = threading.Thread(target=self._run_loop, name="centaur-watcher", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="centaur-watcher",
+            daemon=True,
+        )
         self._thread.start()
 
         self._logger.log_module_summary(
             module="watcher",
             file="(startup)",
-            expected=1,
+            expected_read=1,
             read=1,
+            expected_written=1,
             written=1,
             status="Started",
         )
@@ -99,8 +105,9 @@ class Watcher:
         self._logger.log_module_summary(
             module="watcher",
             file="(shutdown)",
-            expected=1,
+            expected_read=1,
             read=1,
+            expected_written=1,
             written=1,
             status="Stopped",
         )
@@ -117,13 +124,13 @@ class Watcher:
         poll = float(self._config.stability_poll_interval_seconds)
         stability_window = int(self._config.stability_window_seconds)
 
-        # If backfill is enabled, process existing files too.
         if self._config.allow_backfill:
             self._logger.log_module_summary(
                 module="watcher",
                 file="(startup)",
-                expected=1,
+                expected_read=1,
                 read=1,
+                expected_written=1,
                 written=1,
                 status="Backfill enabled",
             )
@@ -139,13 +146,12 @@ class Watcher:
             if file_path in self._seen and not self._config.allow_backfill:
                 continue
 
-            # Mark as seen early to avoid repeated stability checks spamming logs.
+            # Mark as seen early to reduce repeated stability-check work
             self._seen.add(file_path)
 
             try:
                 stable = self._wait_until_stable(file_path, stability_window=stability_window)
             except FileNotFoundError:
-                # File vanished; ignore quietly
                 continue
             except PermissionError as e:
                 self._logger.log_failure(
@@ -165,7 +171,6 @@ class Watcher:
                 continue
 
             if not stable:
-                # Not stable before stop requested
                 continue
 
             rel = self._relative_to_root(file_path, root.root_path)
@@ -181,8 +186,9 @@ class Watcher:
             self._logger.log_module_summary(
                 module="watcher",
                 file=str(file_path),
-                expected=1,
+                expected_read=1,
                 read=1,
+                expected_written=1,
                 written=1,
                 status="READY",
             )
@@ -190,7 +196,6 @@ class Watcher:
     def _iter_candidate_files(self, root: WatchRoot) -> Iterable[Path]:
         root_path = root.root_path
         if not root_path.exists():
-            # Root not available (e.g., network share disconnected)
             self._logger.log_failure(
                 module="watcher",
                 file=str(root_path),
@@ -199,18 +204,12 @@ class Watcher:
             )
             return []
 
-        # Non-recursive by default? For astrophotography, users often store in session subfolders.
-        # We'll do recursive scanning to reduce surprises.
-        # (If you prefer non-recursive, we can change this later via config.)
-        candidates = []
+        candidates: list[Path] = []
         try:
             for p in root_path.rglob("*"):
-                if not p.is_file():
-                    continue
-                if p.suffix.lower() in self._fits_exts:
+                if p.is_file() and p.suffix.lower() in self._fits_exts:
                     candidates.append(p)
         except PermissionError:
-            # If parts of the tree aren't readable, skip them.
             return []
 
         return candidates
@@ -222,17 +221,10 @@ class Watcher:
             return None
 
     def _stat_key(self, p: Path) -> Tuple[int, int]:
-        """
-        Return a tuple that changes if file content is still being written.
-        We use (size, mtime_ns) for a robust signal.
-        """
         st = p.stat()
         return (int(st.st_size), int(st.st_mtime_ns))
 
     def _wait_until_stable(self, p: Path, *, stability_window: int) -> bool:
-        """
-        A file is stable if its stat key does not change for stability_window seconds.
-        """
         poll = float(self._config.stability_poll_interval_seconds)
         required = float(stability_window)
 
@@ -251,8 +243,7 @@ class Watcher:
             if (time.monotonic() - last_change) >= required:
                 return True
 
-            # Safety: don’t wait forever if something is wrong.
-            # (We can make this configurable later if needed.)
+            # Safety timeout (avoid hanging forever)
             if (time.monotonic() - start) > max(60.0, required * 10):
                 self._logger.log_failure(
                     module="watcher",
@@ -263,4 +254,3 @@ class Watcher:
                 return False
 
         return False
-
