@@ -13,6 +13,9 @@ from centaur.schema_sky_background2d import ensure_sky_background2d_schema
 from centaur.schema_camera_constants import ensure_camera_constants_schema
 from centaur.schema_exposure_advice import ensure_exposure_advice_schema
 from centaur.seed_camera_constants import seed_camera_constants
+from centaur.schema_flat_profiles import ensure_flat_profiles_schema
+from centaur.schema_flat_capture_sets import ensure_flat_capture_sets_schema
+from centaur.schema_flat_metrics import ensure_flat_metrics_schema
 
 
 def main() -> None:
@@ -28,6 +31,11 @@ def main() -> None:
     ensure_camera_constants_schema(cfg.db_path)
     ensure_exposure_advice_schema(cfg.db_path)
     seed_camera_constants()
+    ensure_flat_profiles_schema(cfg.db_path)
+    ensure_flat_capture_sets_schema(cfg.db_path)
+    ensure_flat_metrics_schema(cfg.db_path)
+
+
 
 
 
