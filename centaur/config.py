@@ -53,7 +53,9 @@ class AppConfig:
             "sky_basic_worker": True,
             "exposure_advice_worker": True,
             "sky_background2d_worker": True,       
-            "flat_basic_worker": True,}
+            "flat_basic_worker": True,
+            "flat_group_worker": True,
+        }
 
 
     )
