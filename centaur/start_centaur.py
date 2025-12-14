@@ -17,6 +17,7 @@ from centaur.schema_flat_profiles import ensure_flat_profiles_schema
 from centaur.schema_flat_capture_sets import ensure_flat_capture_sets_schema
 from centaur.schema_flat_metrics import ensure_flat_metrics_schema
 from centaur.schema_flat_links import ensure_flat_links_schema
+from centaur.schema_psf_detect import ensure_psf_detect_schema
 
 
 
@@ -37,6 +38,7 @@ def main() -> None:
     ensure_flat_capture_sets_schema(cfg.db_path)
     ensure_flat_metrics_schema(cfg.db_path)
     ensure_flat_links_schema(cfg.db_path)
+    ensure_psf_detect_schema(cfg.db_path)
 
 
 

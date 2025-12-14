@@ -55,10 +55,21 @@ class AppConfig:
             "sky_background2d_worker": True,       
             "flat_basic_worker": True,
             "flat_group_worker": True,
+            "psf_detect_worker": True,
         }
-
-
     )
+
+    # PSF (Phase 3, PSF-0 Detect)
+    psf_use_roi: bool = False
+    psf_roi_fraction: float = 0.5
+    psf_threshold_sigma: float = 8.0
+    psf_min_separation_px: int = 8
+    psf_max_stars: int = 20000
+    psf_edge_margin_px: int = 16
+    psf_debug_dump_candidates_csv: bool = False
+    psf_good_extra_sigma: float = 8.0
+
+
 
     def is_module_enabled(self, module_name: str) -> bool:
         return self.enabled_modules.get(module_name, False)
@@ -82,6 +93,8 @@ def default_config() -> AppConfig:
                 "sky_basic_worker": False,# Example: "fits_header_worker": True
                 "exposure_advice_worker": False,
                 "sky_background2d_worker": False,
+                "psf_detect_worker": False,
+
             },
         ),
     )
