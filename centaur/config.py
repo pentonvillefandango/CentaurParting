@@ -56,6 +56,7 @@ class AppConfig:
             "flat_basic_worker": True,
             "flat_group_worker": True,
             "psf_detect_worker": True,
+            "psf_basic_worker": True,
         }
     )
 
@@ -68,6 +69,9 @@ class AppConfig:
     psf_edge_margin_px: int = 16
     psf_debug_dump_candidates_csv: bool = False
     psf_good_extra_sigma: float = 8.0
+    psf_cutout_radius_px: int = 8
+    psf1_max_stars_measured: int = 0  # 0 = unlimited
+    psf1_debug_dump_measurements_csv: bool = False
 
 
 
@@ -94,6 +98,7 @@ def default_config() -> AppConfig:
                 "exposure_advice_worker": False,
                 "sky_background2d_worker": False,
                 "psf_detect_worker": False,
+                "psf_basic_worker": False,
 
             },
         ),
