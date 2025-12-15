@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple, List
+from typing import Any, Callable, Dict, Optional, Tuple, List
 
 from centaur.config import AppConfig
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
 
-WorkerFn = Callable[[AppConfig, Logger, FileReadyEvent], Optional[bool]]
+# Workers may accept (cfg, logger, event) OR (cfg, logger, event, ctx)
+WorkerFn = Callable[..., Optional[bool]]
 
 
 @dataclass
@@ -17,6 +18,16 @@ class PipelineResult:
     ok: int = 0
     failed: int = 0
     failed_items: List[Tuple[str, str]] = field(default_factory=list)  # (module_name, file_path)
+
+
+@dataclass
+class PipelineContext:
+    """
+    Per-event in-memory context carrier.
+    Used to pass runtime-computed per-star data from PSF-1 to downstream workers
+    without storing per-star rows in the DB.
+    """
+    psf1: Optional[Dict[str, Any]] = None
 
 
 def build_worker_registry() -> Dict[str, WorkerFn]:
@@ -32,10 +43,8 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
     from centaur.flat_group_worker import process_file_event as flat_group_process
     from centaur.psf_detect_worker import process_file_event as psf_detect_process
     from centaur.psf_basic_worker import process_file_event as psf_basic_process
+    from centaur.psf_grid_worker import process_file_event as psf_grid_process
     from centaur.psf_model_worker import process_file_event as psf_model_process
-
-
-
 
     return {
         # Must run first so image_id exists and header tables are populated.
@@ -44,7 +53,6 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
         # Flats
         "flat_group_worker": flat_group_process,
         "flat_basic_worker": flat_basic_process,
-        
 
         # Sky metrics (LIGHT frames)
         "sky_basic_worker": sky_basic_process,
@@ -56,6 +64,7 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
         # PSF layer
         "psf_detect_worker": psf_detect_process,
         "psf_basic_worker": psf_basic_process,
+        "psf_grid_worker": psf_grid_process,   # <-- NEW (consumes PSF-1 context)
         "psf_model_worker": psf_model_process,
     }
 
@@ -66,6 +75,7 @@ def _run_one(
     event: FileReadyEvent,
     registry: Dict[str, WorkerFn],
     result: PipelineResult,
+    ctx: PipelineContext,
     module_name: str,
 ) -> None:
     """
@@ -78,7 +88,12 @@ def _run_one(
         return
 
     result.enabled += 1
-    worker_result = worker_fn(cfg, logger, event)
+
+    # Prefer calling with ctx; fall back for older workers that only take 3 args.
+    try:
+        worker_result = worker_fn(cfg, logger, event, ctx)
+    except TypeError:
+        worker_result = worker_fn(cfg, logger, event)
 
     if worker_result is False:
         result.failed += 1
@@ -99,12 +114,14 @@ def run_pipeline_for_event(
     Rule (v1):
     - Always run fits_header_worker first.
     - If IMAGETYP == FLAT: run flat_group_worker + flat_basic_worker.
-    - If IMAGETYP == LIGHT (or anything else): run sky_basic_worker, sky_background2d_worker, exposure_advice_worker.
+    - If IMAGETYP == LIGHT (or anything else): run sky_basic_worker, sky_background2d_worker, exposure_advice_worker,
+      and PSF modules.
     """
     result = PipelineResult()
+    ctx = PipelineContext()
 
     # 1) Always run FITS header first
-    _run_one(cfg, logger, event, registry, result, "fits_header_worker")
+    _run_one(cfg, logger, event, registry, result, ctx, "fits_header_worker")
 
     # If header ingest failed, stop here.
     if result.failed > 0:
@@ -122,23 +139,39 @@ def run_pipeline_for_event(
 
     # 3) Route
     if imagetyp == "FLAT":
-        _run_one(cfg, logger, event, registry, result, "flat_group_worker")
-        _run_one(cfg, logger, event, registry, result, "flat_basic_worker")
+        _run_one(cfg, logger, event, registry, result, ctx, "flat_group_worker")
+        _run_one(cfg, logger, event, registry, result, ctx, "flat_basic_worker")
 
         # Light-only modules not applicable for flats
-        for name in ("sky_basic_worker", "sky_background2d_worker", "exposure_advice_worker", "psf_detect_worker", "psf_basic_worker", "psf_model_worker"):
+        for name in (
+            "sky_basic_worker",
+            "sky_background2d_worker",
+            "exposure_advice_worker",
+            "psf_detect_worker",
+            "psf_basic_worker",
+            "psf_grid_worker",
+            "psf_model_worker",
+        ):
             if cfg.is_module_enabled(name):
                 result.skipped += 1
 
         return result
 
-    # Non-FLAT frames (LIGHT, DARK, BIAS, unknown): run sky + advice
+    # Non-FLAT frames (LIGHT, DARK, BIAS, unknown): run sky + advice + PSF
     # Flat modules not applicable here
     for name in ("flat_group_worker", "flat_basic_worker"):
         if cfg.is_module_enabled(name):
             result.skipped += 1
 
-    for name in ("sky_basic_worker", "sky_background2d_worker", "exposure_advice_worker", "psf_detect_worker", "psf_basic_worker", "psf_model_worker"):
-        _run_one(cfg, logger, event, registry, result, name)
+    for name in (
+        "sky_basic_worker",
+        "sky_background2d_worker",
+        "exposure_advice_worker",
+        "psf_detect_worker",
+        "psf_basic_worker",
+        "psf_grid_worker",
+        "psf_model_worker",
+    ):
+        _run_one(cfg, logger, event, registry, result, ctx, name)
 
     return result

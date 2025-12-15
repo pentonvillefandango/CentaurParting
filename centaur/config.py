@@ -57,6 +57,7 @@ class AppConfig:
             "flat_group_worker": True,
             "psf_detect_worker": True,
             "psf_basic_worker": True,
+            "psf_grid_worker" : True,
             "psf_model_worker": True,
         }
     )
@@ -105,6 +106,8 @@ def default_config() -> AppConfig:
                 "psf_detect_worker": True,
                 "psf_basic_worker": False,
                 "psf_model_worker": True,
+                "psf_grid_worker" : True,
+
 
 
             },

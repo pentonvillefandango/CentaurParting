@@ -335,7 +335,7 @@ def _insert_module_run(
     )
 
 
-def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Optional[bool]:
+def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ctx: Optional[Any] = None) -> Optional[bool]:
     t0 = time.monotonic()
     started_utc = utc_now()
 
@@ -449,6 +449,18 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 )
 
         n_measured = int(len(hfr_vals))
+
+        # NEW: publish PSF-1 runtime context for downstream workers (best-effort only)
+        if ctx is not None:
+            try:
+                ctx.psf1 = {
+                    "star_xy": list(measured_xy),
+                    "fwhm_px": list(fwhm_vals),
+                    "ecc": list(ecc_vals),
+                    "image_shape": (int(img2d.shape[0]), int(img2d.shape[1])),
+                }
+            except Exception:
+                pass
 
         # NEW: JSON list of the *measured* stars only (PSF-2 should consume this)
         # Keep it simple: list of {x,y}

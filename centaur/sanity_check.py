@@ -1,3 +1,7 @@
+# ---------------------------------------------
+# how to run
+# python3 centaur/sanity_check.py --db data/centaurparting.db --out data/sanity_report3.csv --summary data/sanity_summary3.json
+# ---------------------------------------------
 
 from __future__ import annotations
 
@@ -87,6 +91,7 @@ class ImageRow:
     exposure_ok: str = ""
     psf0_ok: str = ""
     psf1_ok: str = ""
+    psf_grid_ok: str = ""
     psf2_ok: str = ""
     flat_group_ok: str = ""
     flat_basic_ok: str = ""
@@ -102,9 +107,17 @@ class ImageRow:
     psf2_gauss_fwhm_p90: Optional[float] = None
     psf2_gauss_ecc_med: Optional[float] = None
 
+    # PSF grid key rollups
+    psf_grid_n_input_stars: Optional[int] = None
+    psf_grid_n_cells_with_data: Optional[int] = None
+    psf_grid_center_fwhm_px: Optional[float] = None
+    psf_grid_corner_fwhm_px_median: Optional[float] = None
+    psf_grid_center_to_corner_ratio: Optional[float] = None
+
     # performance
     psf2_duration_ms: Optional[int] = None
     psf2_ms_per_star: Optional[float] = None
+    psf_grid_duration_ms: Optional[int] = None
 
     # anomalies
     anomalies: str = ""
@@ -115,7 +128,6 @@ class ImageRow:
 # -----------------------------
 
 def _fetch_images(conn: sqlite3.Connection) -> List[sqlite3.Row]:
-    # images has file_name/status; fits_header_core has imagetyp/naxis1/naxis2
     sql = """
     SELECT
       i.image_id,
@@ -132,10 +144,6 @@ def _fetch_images(conn: sqlite3.Connection) -> List[sqlite3.Row]:
 
 
 def _module_run_ok_map(conn: sqlite3.Connection) -> Dict[Tuple[int, str], int]:
-    """
-    Map (image_id, module_name) -> 1 if latest run status == 'ok' else 0.
-    If multiple runs exist, we pick the latest by ended_utc if present, else rowid.
-    """
     if not _table_exists(conn, "module_runs"):
         return {}
 
@@ -146,7 +154,6 @@ def _module_run_ok_map(conn: sqlite3.Connection) -> Dict[Tuple[int, str], int]:
         """
     ).fetchall()
 
-    # If multiple exist, last-write-wins by iteration order; OK for sanity report
     out: Dict[Tuple[int, str], int] = {}
     for r in rows:
         key = (int(r["image_id"]), str(r["module_name"]))
@@ -179,7 +186,6 @@ def _check_sky_basic(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) 
         _append_anom(anoms, "sky_basic_missing_row")
         return
 
-    # light touch: health fractions in [0,1]
     nanf = _safe_float(r["nan_fraction"])
     inff = _safe_float(r["inf_fraction"])
     if not _clamp01(nanf):
@@ -187,11 +193,9 @@ def _check_sky_basic(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) 
     if not _clamp01(inff):
         _append_anom(anoms, "sky_basic_inf_fraction_out_of_range")
 
-    # store a couple of helpful values in report row
     row.sky_roi_median_adu = _safe_float(r["roi_median_adu"])
     row.sky_roi_madstd_adu = _safe_float(r["roi_madstd_adu"])
 
-    # consistency checks if values exist
     vmin = _safe_float(r["roi_min_adu"])
     vmax = _safe_float(r["roi_max_adu"])
     vmed = row.sky_roi_median_adu
@@ -219,7 +223,6 @@ def _check_sky_bkg2d(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) 
     if not r:
         _append_anom(anoms, "sky_background2d_missing_row")
         return
-    # not assuming exact schema; just check audit if present
     if "expected_fields" in r.keys() and "written_fields" in r.keys():
         ef = int(r["expected_fields"] or 0)
         wf = int(r["written_fields"] or 0)
@@ -278,7 +281,6 @@ def _check_psf1(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> No
     if usable == 0 and reason == "ok":
         _append_anom(anoms, "psf1_not_usable_but_reason_ok")
 
-    # JSON sanity (if present)
     star_json = r["star_xy_json"]
     if star_json is not None:
         try:
@@ -288,13 +290,85 @@ def _check_psf1(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> No
             else:
                 if len(arr) != n_meas:
                     _append_anom(anoms, "psf1_star_xy_json_len_mismatch")
-                # spot-check first few shapes
                 for j in arr[:5]:
                     if not isinstance(j, dict) or "x" not in j or "y" not in j:
                         _append_anom(anoms, "psf1_star_xy_json_bad_items")
                         break
         except Exception:
             _append_anom(anoms, "psf1_star_xy_json_parse_failed")
+
+
+def _check_psf_grid(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> None:
+    if not _table_exists(conn, "psf_grid_metrics"):
+        return
+    r = conn.execute(
+        """
+        SELECT
+          grid_rows,
+          grid_cols,
+          grid_min_stars_per_cell,
+          n_input_stars,
+          n_cells_with_data,
+          center_fwhm_px,
+          corner_fwhm_px_median,
+          center_to_corner_fwhm_ratio,
+          left_right_fwhm_ratio,
+          top_bottom_fwhm_ratio,
+          usable,
+          reason,
+
+          cell_r0c0_n, cell_r0c1_n, cell_r0c2_n,
+          cell_r1c0_n, cell_r1c1_n, cell_r1c2_n,
+          cell_r2c0_n, cell_r2c1_n, cell_r2c2_n
+        FROM psf_grid_metrics
+        WHERE image_id=?
+        """,
+        (row.image_id,),
+    ).fetchone()
+    if not r:
+        _append_anom(anoms, "psf_grid_missing_row")
+        return
+
+    grid_rows = int(r["grid_rows"] or 0)
+    grid_cols = int(r["grid_cols"] or 0)
+    if grid_rows != 3 or grid_cols != 3:
+        _append_anom(anoms, f"psf_grid_unexpected_grid_size({grid_rows}x{grid_cols})")
+
+    n_input = int(r["n_input_stars"] or 0)
+    n_cells = int(r["n_cells_with_data"] or 0)
+    row.psf_grid_n_input_stars = n_input
+    row.psf_grid_n_cells_with_data = n_cells
+
+    row.psf_grid_center_fwhm_px = _safe_float(r["center_fwhm_px"])
+    row.psf_grid_corner_fwhm_px_median = _safe_float(r["corner_fwhm_px_median"])
+    row.psf_grid_center_to_corner_ratio = _safe_float(r["center_to_corner_fwhm_ratio"])
+
+    # Invariant: sum of cell counts should not exceed n_input_stars
+    cell_counts = [
+        int(r["cell_r0c0_n"] or 0), int(r["cell_r0c1_n"] or 0), int(r["cell_r0c2_n"] or 0),
+        int(r["cell_r1c0_n"] or 0), int(r["cell_r1c1_n"] or 0), int(r["cell_r1c2_n"] or 0),
+        int(r["cell_r2c0_n"] or 0), int(r["cell_r2c1_n"] or 0), int(r["cell_r2c2_n"] or 0),
+    ]
+    sum_cells = sum(cell_counts)
+    if n_input > 0 and sum_cells > n_input:
+        _append_anom(anoms, f"psf_grid_sum_cell_n_gt_input({sum_cells}>{n_input})")
+
+    # Ratios should be positive if present
+    for col, name in [
+        ("center_to_corner_fwhm_ratio", "psf_grid_center_to_corner_ratio_nonpos"),
+        ("left_right_fwhm_ratio", "psf_grid_left_right_ratio_nonpos"),
+        ("top_bottom_fwhm_ratio", "psf_grid_top_bottom_ratio_nonpos"),
+    ]:
+        v = _safe_float(r[col])
+        if v is not None and v <= 0:
+            _append_anom(anoms, name)
+
+    usable = int(r["usable"] or 0)
+    reason = str(r["reason"] or "")
+    if usable == 1 and n_cells < 3:
+        _append_anom(anoms, "psf_grid_usable_but_too_few_cells")
+    if usable == 0 and reason == "ok":
+        _append_anom(anoms, "psf_grid_not_usable_but_reason_ok")
 
 
 def _check_psf2(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> None:
@@ -326,8 +400,6 @@ def _check_psf2(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> No
     row.psf2_gauss_fwhm_p90 = _safe_float(r["gauss_fwhm_px_p90"])
     row.psf2_gauss_ecc_med = _safe_float(r["gauss_ecc_median"])
 
-    # The key invariant (for your final design): modeled should never exceed PSF-1 input.
-    # If this triggers, something re-detected / duplicated.
     if n_input > 0 and n_mod > n_input:
         _append_anom(anoms, f"psf2_modeled_gt_input({n_mod}>{n_input})")
 
@@ -339,7 +411,7 @@ def _check_psf2(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> No
         _append_anom(anoms, "psf2_not_usable_but_reason_ok")
 
 
-def _psf2_duration(conn: sqlite3.Connection, image_id: int) -> Optional[int]:
+def _module_duration(conn: sqlite3.Connection, image_id: int, module_name: str) -> Optional[int]:
     if not _table_exists(conn, "module_runs"):
         return None
     r = conn.execute(
@@ -347,11 +419,11 @@ def _psf2_duration(conn: sqlite3.Connection, image_id: int) -> Optional[int]:
         SELECT duration_ms
         FROM module_runs
         WHERE image_id=?
-          AND module_name='psf_model_worker'
+          AND module_name=?
         ORDER BY rowid DESC
         LIMIT 1
         """,
-        (image_id,),
+        (image_id, module_name),
     ).fetchone()
     if not r:
         return None
@@ -371,7 +443,6 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
     images = _fetch_images(conn)
     mod_ok = _module_run_ok_map(conn)
 
-    # quick summary counters
     summary: Dict[str, Any] = {
         "db_path": str(db_path),
         "n_images": len(images),
@@ -381,7 +452,6 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
         "anomaly_counts": {},
     }
 
-    # detect available tables
     for t in [
         "images",
         "fits_header_core",
@@ -390,6 +460,7 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
         "exposure_advice",
         "psf_detect_metrics",
         "psf_basic_metrics",
+        "psf_grid_metrics",      # NEW
         "psf_model_metrics",
         "module_runs",
         "flat_metrics",
@@ -408,7 +479,6 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
         na1 = int(naxis1) if naxis1 is not None else None
         na2 = int(naxis2) if naxis2 is not None else None
 
-        # counts
         summary["status_counts"][status] = summary["status_counts"].get(status, 0) + 1
         summary["imagetyp_counts"][imagetyp] = summary["imagetyp_counts"].get(imagetyp, 0) + 1
 
@@ -423,14 +493,11 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
 
         anoms: List[str] = []
 
-        # module ok flags (based on module_runs if present)
         row.fits_ok = mod_ok.get((image_id, "fits_header_worker"), 0)
 
-        # applicability routing
         is_flat = (imagetyp == "FLAT")
         is_light = (imagetyp == "LIGHT" or imagetyp == "")
 
-        # For readability in CSV: "" means N/A; "1"/"0" means applicable
         def set_flag(attr: str, applicable: bool, module_name: str) -> None:
             if not applicable:
                 setattr(row, attr, "")
@@ -446,26 +513,27 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
 
         set_flag("psf0_ok", (not is_flat), "psf_detect_worker")
         set_flag("psf1_ok", (not is_flat), "psf_basic_worker")
+        set_flag("psf_grid_ok", (not is_flat), "psf_grid_worker")   # NEW
         set_flag("psf2_ok", (not is_flat), "psf_model_worker")
 
-        # core checks
         _check_fits_header(row, anoms)
 
-        # metrics checks (only if not flat)
         if not is_flat:
             _check_sky_basic(conn, row, anoms)
             _check_sky_bkg2d(conn, row, anoms)
             _check_psf0(conn, row, anoms)
             _check_psf1(conn, row, anoms)
+            _check_psf_grid(conn, row, anoms)   # NEW
             _check_psf2(conn, row, anoms)
 
-            # perf
-            d = _psf2_duration(conn, image_id)
-            row.psf2_duration_ms = d
-            if d is not None and row.psf2_n_modeled and row.psf2_n_modeled > 0:
-                row.psf2_ms_per_star = float(d) / float(row.psf2_n_modeled)
+            d2 = _module_duration(conn, image_id, "psf_model_worker")
+            row.psf2_duration_ms = d2
+            if d2 is not None and row.psf2_n_modeled and row.psf2_n_modeled > 0:
+                row.psf2_ms_per_star = float(d2) / float(row.psf2_n_modeled)
 
-        # anomaly bookkeeping
+            dg = _module_duration(conn, image_id, "psf_grid_worker")
+            row.psf_grid_duration_ms = dg
+
         row.anomalies = ";".join(anoms)
         for a in anoms:
             summary["anomaly_counts"][a] = summary["anomaly_counts"].get(a, 0) + 1
@@ -480,14 +548,26 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
             "image_id", "file_name", "status", "imagetyp", "naxis1", "naxis2",
             "fits_ok",
             "sky_basic_ok", "sky_background2d_ok", "exposure_ok",
-            "psf0_ok", "psf1_ok", "psf2_ok",
+            "psf0_ok", "psf1_ok", "psf_grid_ok", "psf2_ok",
             "flat_group_ok", "flat_basic_ok",
+
             "sky_roi_median_adu", "sky_roi_madstd_adu",
+
             "psf0_n_peaks_good",
             "psf1_n_measured",
+
+            "psf_grid_n_input_stars",
+            "psf_grid_n_cells_with_data",
+            "psf_grid_center_fwhm_px",
+            "psf_grid_corner_fwhm_px_median",
+            "psf_grid_center_to_corner_ratio",
+
             "psf2_n_modeled",
             "psf2_gauss_fwhm_med", "psf2_gauss_fwhm_p90", "psf2_gauss_ecc_med",
+
+            "psf_grid_duration_ms",
             "psf2_duration_ms", "psf2_ms_per_star",
+
             "anomalies",
         ])
         for r in rows_out:
@@ -495,14 +575,26 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
                 r.image_id, r.file_name, r.status, r.imagetyp, r.naxis1, r.naxis2,
                 r.fits_ok,
                 r.sky_basic_ok, r.sky_bkg2d_ok, r.exposure_ok,
-                r.psf0_ok, r.psf1_ok, r.psf2_ok,
+                r.psf0_ok, r.psf1_ok, r.psf_grid_ok, r.psf2_ok,
                 r.flat_group_ok, r.flat_basic_ok,
+
                 r.sky_roi_median_adu, r.sky_roi_madstd_adu,
+
                 r.psf0_n_peaks_good,
                 r.psf1_n_measured,
+
+                r.psf_grid_n_input_stars,
+                r.psf_grid_n_cells_with_data,
+                r.psf_grid_center_fwhm_px,
+                r.psf_grid_corner_fwhm_px_median,
+                r.psf_grid_center_to_corner_ratio,
+
                 r.psf2_n_modeled,
                 r.psf2_gauss_fwhm_med, r.psf2_gauss_fwhm_p90, r.psf2_gauss_ecc_med,
+
+                r.psf_grid_duration_ms,
                 r.psf2_duration_ms, r.psf2_ms_per_star,
+
                 r.anomalies,
             ])
 
@@ -511,7 +603,6 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
     with out_json.open("w") as f:
         json.dump(summary, f, indent=2)
 
-    # Print a small console summary (kept short on purpose)
     n_anom_total = sum(int(v) for v in summary["anomaly_counts"].values())
     print(f"[sanity_check] images={summary['n_images']} total_anomalies={n_anom_total}")
     if summary["anomaly_counts"]:

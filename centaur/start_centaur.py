@@ -20,6 +20,7 @@ from centaur.schema_flat_links import ensure_flat_links_schema
 from centaur.schema_psf_detect import ensure_psf_detect_schema
 from centaur.schema_psf_basic import ensure_psf_basic_schema
 from centaur.schema_psf_model import ensure_psf_model_schema
+from centaur.schema_psf_grid import ensure_psf_grid_schema
 
 
 
@@ -43,6 +44,7 @@ def main() -> None:
     ensure_psf_detect_schema(cfg.db_path)
     ensure_psf_basic_schema(cfg.db_path)
     ensure_psf_model_schema(cfg.db_path)
+    ensure_psf_grid_schema(cfg.db_path)
 
 
 

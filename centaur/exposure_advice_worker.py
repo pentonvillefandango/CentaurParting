@@ -1,12 +1,65 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from centaur.config import AppConfig
 from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
+
+MODULE_NAME = "exposure_advice_worker"
+
+
+def utc_now() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
+    row = db.execute(
+        "SELECT image_id FROM images WHERE file_path = ?",
+        (str(file_path),),
+    ).fetchone()
+    return int(row["image_id"]) if row else None
+
+
+def _insert_module_run(
+    db: Database,
+    image_id: int,
+    *,
+    expected_read: int,
+    read: int,
+    written: int,
+    status: str,
+    message: Optional[str],
+    started_utc: str,
+    ended_utc: str,
+    duration_ms: int,
+) -> None:
+    db.execute(
+        """
+        INSERT INTO module_runs
+        (image_id, module_name, expected_fields, read_fields, written_fields,
+         status, message, started_utc, ended_utc, duration_ms, db_written_utc)
+        VALUES (?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            image_id,
+            MODULE_NAME,
+            expected_read,
+            read,
+            written,
+            status,
+            message,
+            started_utc,
+            ended_utc,
+            duration_ms,
+            utc_now(),
+        ),
+    )
 
 
 def _extract_gain_setting(db: Database, image_id: int) -> Optional[int]:
@@ -35,10 +88,26 @@ def _extract_gain_setting(db: Database, image_id: int) -> Optional[int]:
 
 
 def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> bool:
-    start = time.monotonic()
+    t0 = time.monotonic()
+    started_utc = utc_now()
+
+    # These match your existing logger summaries
+    EXPECTED_READ_OK = 6
+    EXPECTED_WRITTEN_OK = 7
 
     try:
         with Database().transaction() as db:
+            # Resolve image_id early so we can always write module_runs
+            image_id = _get_image_id(db, event.file_path)
+            if image_id is None:
+                logger.log_failure(
+                    module=MODULE_NAME,
+                    file=str(event.file_path),
+                    action="continue",
+                    reason="image_id_not_found",
+                )
+                return False
+
             # Pull prerequisites
             row = db.execute(
                 """
@@ -52,21 +121,34 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 JOIN fits_header_core f USING(image_id)
                 JOIN sky_basic_metrics sb USING(image_id)
                 JOIN sky_background2d_metrics b USING(image_id)
-                WHERE i.file_path = ?
+                WHERE i.image_id = ?
                 """,
-                (str(event.file_path),),
+                (image_id,),
             ).fetchone()
 
             if row is None:
+                # Record the failure in module_runs as well
+                _insert_module_run(
+                    db,
+                    image_id,
+                    expected_read=EXPECTED_READ_OK,
+                    read=0,
+                    written=0,
+                    status="failed",
+                    message="missing_prerequisites",
+                    started_utc=started_utc,
+                    ended_utc=utc_now(),
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                )
+
                 logger.log_failure(
-                    module="exposure_advice_worker",
+                    module=MODULE_NAME,
                     file=str(event.file_path),
                     action="continue",
                     reason="missing_prerequisites",
                 )
                 return False
 
-            image_id = int(row["image_id"])
             camera_name = row["camera_name"] or ""
             sky_rate_adu_s = float(row["sky_rate_adu_s"] or 0.0)
             grad_p95 = float(row["grad_p95"] or 0.0)
@@ -99,15 +181,28 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     (image_id, f"missing_camera_constants_for_gain:{gain_setting}"),
                 )
 
+                _insert_module_run(
+                    db,
+                    image_id,
+                    expected_read=5,
+                    read=5,
+                    written=1,
+                    status="ok",
+                    message=f"no_constants_for_gain:{gain_setting}",
+                    started_utc=started_utc,
+                    ended_utc=utc_now(),
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                )
+
                 logger.log_module_summary(
-                    module="exposure_advice_worker",
+                    module=MODULE_NAME,
                     file=str(event.file_path),
                     expected_read=5,
                     read=5,
                     expected_written=1,
                     written=1,
                     status=f"OK (no constants for gain={gain_setting})",
-                    duration_s=time.monotonic() - start,
+                    duration_s=time.monotonic() - t0,
                 )
                 return True
 
@@ -126,15 +221,28 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     (image_id, "invalid_sky_rate"),
                 )
 
+                _insert_module_run(
+                    db,
+                    image_id,
+                    expected_read=5,
+                    read=5,
+                    written=1,
+                    status="ok",
+                    message="invalid_sky_rate",
+                    started_utc=started_utc,
+                    ended_utc=utc_now(),
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                )
+
                 logger.log_module_summary(
-                    module="exposure_advice_worker",
+                    module=MODULE_NAME,
                     file=str(event.file_path),
                     expected_read=5,
                     read=5,
                     expected_written=1,
                     written=1,
                     status="OK (invalid sky rate)",
-                    duration_s=time.monotonic() - start,
+                    duration_s=time.monotonic() - t0,
                 )
                 return True
 
@@ -176,21 +284,34 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 ),
             )
 
+            _insert_module_run(
+                db,
+                image_id,
+                expected_read=EXPECTED_READ_OK,
+                read=EXPECTED_READ_OK,
+                written=EXPECTED_WRITTEN_OK,
+                status="ok",
+                message=None,
+                started_utc=started_utc,
+                ended_utc=utc_now(),
+                duration_ms=int((time.monotonic() - t0) * 1000),
+            )
+
         logger.log_module_summary(
-            module="exposure_advice_worker",
+            module=MODULE_NAME,
             file=str(event.file_path),
-            expected_read=6,
-            read=6,
-            expected_written=7,
-            written=7,
+            expected_read=EXPECTED_READ_OK,
+            read=EXPECTED_READ_OK,
+            expected_written=EXPECTED_WRITTEN_OK,
+            written=EXPECTED_WRITTEN_OK,
             status="OK",
-            duration_s=time.monotonic() - start,
+            duration_s=time.monotonic() - t0,
         )
         return True
 
     except Exception as e:
         logger.log_failure(
-            module="exposure_advice_worker",
+            module=MODULE_NAME,
             file=str(event.file_path),
             action="continue",
             reason=f"{type(e).__name__}:{e}",
