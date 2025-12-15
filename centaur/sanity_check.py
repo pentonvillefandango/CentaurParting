@@ -54,6 +54,10 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _is_finite(v: Optional[float]) -> bool:
+    return v is not None and (v == v) and (v != float("inf")) and (v != float("-inf"))
+
+
 def _clamp01(v: Optional[float]) -> bool:
     if v is None:
         return True
@@ -69,6 +73,12 @@ def _median(vals: List[float]) -> Optional[float]:
     if n % 2 == 1:
         return s[mid]
     return 0.5 * (s[mid - 1] + s[mid])
+
+
+def _approx_equal(a: Optional[float], b: Optional[float], tol: float = 1e-6) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= tol
 
 
 # -----------------------------
@@ -107,12 +117,20 @@ class ImageRow:
     psf2_gauss_fwhm_p90: Optional[float] = None
     psf2_gauss_ecc_med: Optional[float] = None
 
-    # PSF grid key rollups
+    # PSF grid key rollups (existing)
     psf_grid_n_input_stars: Optional[int] = None
     psf_grid_n_cells_with_data: Optional[int] = None
     psf_grid_center_fwhm_px: Optional[float] = None
     psf_grid_corner_fwhm_px_median: Optional[float] = None
     psf_grid_center_to_corner_ratio: Optional[float] = None
+
+    # PSF grid NEW rollups (latest)
+    psf_grid_fwhm_cell_median_overall: Optional[float] = None
+    psf_grid_fwhm_cell_iqr_overall: Optional[float] = None
+    psf_grid_fwhm_cell_range: Optional[float] = None
+    psf_grid_fwhm_center_minus_corner: Optional[float] = None
+    psf_grid_ecc_cell_median_overall: Optional[float] = None
+    psf_grid_ecc_center_minus_corners: Optional[float] = None
 
     # performance
     psf2_duration_ms: Optional[int] = None
@@ -301,30 +319,49 @@ def _check_psf1(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> No
 def _check_psf_grid(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> None:
     if not _table_exists(conn, "psf_grid_metrics"):
         return
-    r = conn.execute(
-        """
-        SELECT
-          grid_rows,
-          grid_cols,
-          grid_min_stars_per_cell,
-          n_input_stars,
-          n_cells_with_data,
-          center_fwhm_px,
-          corner_fwhm_px_median,
-          center_to_corner_fwhm_ratio,
-          left_right_fwhm_ratio,
-          top_bottom_fwhm_ratio,
-          usable,
-          reason,
 
-          cell_r0c0_n, cell_r0c1_n, cell_r0c2_n,
-          cell_r1c0_n, cell_r1c1_n, cell_r1c2_n,
-          cell_r2c0_n, cell_r2c1_n, cell_r2c2_n
-        FROM psf_grid_metrics
-        WHERE image_id=?
-        """,
-        (row.image_id,),
-    ).fetchone()
+    # We want to support both:
+    # - older psf_grid_metrics schema (no new rollup cols)
+    # - latest schema (with new rollup cols)
+    has_new = _col_exists(conn, "psf_grid_metrics", "fwhm_cell_median_overall")
+
+    select_cols = [
+        "grid_rows",
+        "grid_cols",
+        "grid_min_stars_per_cell",
+        "n_input_stars",
+        "n_cells_with_data",
+        "center_fwhm_px",
+        "corner_fwhm_px_median",
+        "center_to_corner_fwhm_ratio",
+        "left_right_fwhm_ratio",
+        "top_bottom_fwhm_ratio",
+        "usable",
+        "reason",
+        "cell_r0c0_n", "cell_r0c1_n", "cell_r0c2_n",
+        "cell_r1c0_n", "cell_r1c1_n", "cell_r1c2_n",
+        "cell_r2c0_n", "cell_r2c1_n", "cell_r2c2_n",
+    ]
+
+    if has_new:
+        select_cols.extend([
+            "fwhm_cell_median_overall",
+            "fwhm_cell_iqr_overall",
+            "fwhm_cell_min",
+            "fwhm_cell_max",
+            "fwhm_cell_range",
+            "fwhm_center_minus_corner",
+            "fwhm_left_right_delta",
+            "fwhm_top_bottom_delta",
+            "ecc_cell_median_overall",
+            "ecc_cell_max",
+            "ecc_center",
+            "ecc_corners_median",
+            "ecc_center_minus_corners",
+        ])
+
+    sql = f"SELECT {', '.join(select_cols)} FROM psf_grid_metrics WHERE image_id=?"
+    r = conn.execute(sql, (row.image_id,)).fetchone()
     if not r:
         _append_anom(anoms, "psf_grid_missing_row")
         return
@@ -369,6 +406,73 @@ def _check_psf_grid(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -
         _append_anom(anoms, "psf_grid_usable_but_too_few_cells")
     if usable == 0 and reason == "ok":
         _append_anom(anoms, "psf_grid_not_usable_but_reason_ok")
+
+    # ---------
+    # NEW rollup checks (only if schema has them)
+    # ---------
+    if has_new:
+        f_med = _safe_float(r["fwhm_cell_median_overall"])
+        f_iqr = _safe_float(r["fwhm_cell_iqr_overall"])
+        f_min = _safe_float(r["fwhm_cell_min"])
+        f_max = _safe_float(r["fwhm_cell_max"])
+        f_rng = _safe_float(r["fwhm_cell_range"])
+
+        row.psf_grid_fwhm_cell_median_overall = f_med
+        row.psf_grid_fwhm_cell_iqr_overall = f_iqr
+        row.psf_grid_fwhm_cell_range = f_rng
+        row.psf_grid_fwhm_center_minus_corner = _safe_float(r["fwhm_center_minus_corner"])
+
+        # IQR should be non-negative if present
+        if f_iqr is not None and f_iqr < 0:
+            _append_anom(anoms, "psf_grid_fwhm_iqr_negative")
+
+        # min/max ordering
+        if f_min is not None and f_max is not None and f_min > f_max:
+            _append_anom(anoms, "psf_grid_fwhm_min_gt_max")
+
+        # median within min/max
+        if f_med is not None and f_min is not None and f_max is not None:
+            if not (f_min <= f_med <= f_max):
+                _append_anom(anoms, "psf_grid_fwhm_median_outside_minmax")
+
+        # range consistency: range ~= max-min (loose tolerance)
+        if f_rng is not None and f_min is not None and f_max is not None:
+            expected = f_max - f_min
+            if not _approx_equal(f_rng, expected, tol=1e-3):
+                _append_anom(anoms, "psf_grid_fwhm_range_mismatch")
+
+        # deltas should be finite if present
+        for col, msg in [
+            ("fwhm_center_minus_corner", "psf_grid_fwhm_center_minus_corner_nonfinite"),
+            ("fwhm_left_right_delta", "psf_grid_fwhm_left_right_delta_nonfinite"),
+            ("fwhm_top_bottom_delta", "psf_grid_fwhm_top_bottom_delta_nonfinite"),
+        ]:
+            v = _safe_float(r[col])
+            if v is not None and not _is_finite(v):
+                _append_anom(anoms, msg)
+
+        # ECC checks
+        e_med = _safe_float(r["ecc_cell_median_overall"])
+        e_max = _safe_float(r["ecc_cell_max"])
+        e_ctr = _safe_float(r["ecc_center"])
+        e_corn = _safe_float(r["ecc_corners_median"])
+        e_d = _safe_float(r["ecc_center_minus_corners"])
+
+        row.psf_grid_ecc_cell_median_overall = e_med
+        row.psf_grid_ecc_center_minus_corners = e_d
+
+        if not _clamp01(e_med):
+            _append_anom(anoms, "psf_grid_ecc_median_out_of_range")
+        if not _clamp01(e_max):
+            _append_anom(anoms, "psf_grid_ecc_max_out_of_range")
+        if not _clamp01(e_ctr):
+            _append_anom(anoms, "psf_grid_ecc_center_out_of_range")
+        if not _clamp01(e_corn):
+            _append_anom(anoms, "psf_grid_ecc_corners_out_of_range")
+
+        # ecc_center_minus_corners is a delta; just require finite if present
+        if e_d is not None and not _is_finite(e_d):
+            _append_anom(anoms, "psf_grid_ecc_center_minus_corners_nonfinite")
 
 
 def _check_psf2(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> None:
@@ -460,7 +564,7 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
         "exposure_advice",
         "psf_detect_metrics",
         "psf_basic_metrics",
-        "psf_grid_metrics",      # NEW
+        "psf_grid_metrics",
         "psf_model_metrics",
         "module_runs",
         "flat_metrics",
@@ -496,7 +600,6 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
         row.fits_ok = mod_ok.get((image_id, "fits_header_worker"), 0)
 
         is_flat = (imagetyp == "FLAT")
-        is_light = (imagetyp == "LIGHT" or imagetyp == "")
 
         def set_flag(attr: str, applicable: bool, module_name: str) -> None:
             if not applicable:
@@ -513,7 +616,7 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
 
         set_flag("psf0_ok", (not is_flat), "psf_detect_worker")
         set_flag("psf1_ok", (not is_flat), "psf_basic_worker")
-        set_flag("psf_grid_ok", (not is_flat), "psf_grid_worker")   # NEW
+        set_flag("psf_grid_ok", (not is_flat), "psf_grid_worker")
         set_flag("psf2_ok", (not is_flat), "psf_model_worker")
 
         _check_fits_header(row, anoms)
@@ -523,7 +626,7 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
             _check_sky_bkg2d(conn, row, anoms)
             _check_psf0(conn, row, anoms)
             _check_psf1(conn, row, anoms)
-            _check_psf_grid(conn, row, anoms)   # NEW
+            _check_psf_grid(conn, row, anoms)
             _check_psf2(conn, row, anoms)
 
             d2 = _module_duration(conn, image_id, "psf_model_worker")
@@ -562,6 +665,14 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
             "psf_grid_corner_fwhm_px_median",
             "psf_grid_center_to_corner_ratio",
 
+            # NEW grid rollups (latest)
+            "psf_grid_fwhm_cell_median_overall",
+            "psf_grid_fwhm_cell_iqr_overall",
+            "psf_grid_fwhm_cell_range",
+            "psf_grid_fwhm_center_minus_corner",
+            "psf_grid_ecc_cell_median_overall",
+            "psf_grid_ecc_center_minus_corners",
+
             "psf2_n_modeled",
             "psf2_gauss_fwhm_med", "psf2_gauss_fwhm_p90", "psf2_gauss_ecc_med",
 
@@ -588,6 +699,13 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
                 r.psf_grid_center_fwhm_px,
                 r.psf_grid_corner_fwhm_px_median,
                 r.psf_grid_center_to_corner_ratio,
+
+                r.psf_grid_fwhm_cell_median_overall,
+                r.psf_grid_fwhm_cell_iqr_overall,
+                r.psf_grid_fwhm_cell_range,
+                r.psf_grid_fwhm_center_minus_corner,
+                r.psf_grid_ecc_cell_median_overall,
+                r.psf_grid_ecc_center_minus_corners,
 
                 r.psf2_n_modeled,
                 r.psf2_gauss_fwhm_med, r.psf2_gauss_fwhm_p90, r.psf2_gauss_ecc_med,

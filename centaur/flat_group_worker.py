@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import time
@@ -17,6 +16,47 @@ MODULE_NAME = "flat_group_worker"
 LOCAL_TZ = ZoneInfo("Europe/London")
 
 
+def utc_now() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _insert_module_run(
+    db: Database,
+    image_id: int,
+    *,
+    expected_read: int,
+    read: int,
+    written: int,
+    status: str,
+    message: Optional[str],
+    started_utc: str,
+    ended_utc: str,
+    duration_ms: int,
+) -> None:
+    db.execute(
+        """
+        INSERT INTO module_runs
+        (image_id, module_name, expected_fields, read_fields, written_fields,
+         status, message, started_utc, ended_utc, duration_ms, db_written_utc)
+        VALUES (?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            image_id,
+            MODULE_NAME,
+            expected_read,
+            read,
+            written,
+            status,
+            message,
+            started_utc,
+            ended_utc,
+            duration_ms,
+            utc_now(),
+        ),
+    )
+
+
 def _is_flat(imagetyp: Optional[str]) -> bool:
     return (imagetyp or "").strip().upper() == "FLAT"
 
@@ -31,7 +71,6 @@ def _night_key_from_date_obs(date_obs: Optional[str]) -> Optional[str]:
     if not date_obs:
         return None
     try:
-        # FITS often provides ISO; may include fractional seconds
         dt = datetime.fromisoformat(date_obs.replace("Z", "+00:00"))
     except Exception:
         return None
@@ -66,7 +105,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
 
     Runs only when IMAGETYP=FLAT.
     """
-    start = time.monotonic()
+    t0 = time.monotonic()
+    started_utc = utc_now()
     file_path = str(event.file_path)
 
     try:
@@ -103,11 +143,25 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 )
                 return False
 
+            image_id = int(row["image_id"])
+
             if not _is_flat(row["imagetyp"]):
-                # Not applicable
+                # Not applicable, but log a clean module_run so sanity tools can see it ran.
+                ended_utc = utc_now()
+                _insert_module_run(
+                    db,
+                    image_id,
+                    expected_read=1,
+                    read=1,
+                    written=0,
+                    status="ok",
+                    message="not_applicable_non_flat",
+                    started_utc=started_utc,
+                    ended_utc=ended_utc,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                )
                 return True
 
-            image_id = int(row["image_id"])
             camera = (row["camera"] or "").strip()
             filt = (row["filter"] or None)
             target = (row["target"] or None)
@@ -117,7 +171,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             naxis1 = row["naxis1"]
             naxis2 = row["naxis2"]
 
-            # Binning as "1x1"
             xb = row["xbinning"]
             yb = row["ybinning"]
             binning = None
@@ -176,14 +229,14 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                         float(focallen) if focallen is not None else None,
                         int(naxis1) if naxis1 is not None else None,
                         int(naxis2) if naxis2 is not None else None,
-                        datetime.now(timezone.utc).isoformat(),
+                        utc_now(),
                     ),
                 )
                 flat_profile_id = int(db.execute("SELECT last_insert_rowid() AS id;").fetchone()["id"])
             else:
                 flat_profile_id = int(prof["flat_profile_id"])
 
-            # 2) Find or create capture set (night/target/filter/exptime)
+            # 2) Find or create capture set
             cap = db.execute(
                 """
                 SELECT flat_capture_set_id
@@ -223,7 +276,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                         binning,
                         float(exptime) if exptime is not None else None,
                         flat_profile_id,
-                        datetime.now(timezone.utc).isoformat(),
+                        utc_now(),
                     ),
                 )
                 flat_capture_set_id = int(db.execute("SELECT last_insert_rowid() AS id;").fetchone()["id"])
@@ -241,8 +294,25 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     image_id,
                     flat_profile_id,
                     flat_capture_set_id,
-                    datetime.now(timezone.utc).isoformat(),
+                    utc_now(),
                 ),
+            )
+
+            ended_utc = utc_now()
+            duration_ms = int((time.monotonic() - t0) * 1000)
+
+            # module_runs audit (so sanity can mark FLAT modules OK)
+            _insert_module_run(
+                db,
+                image_id,
+                expected_read=1,
+                read=1,
+                written=1,
+                status="ok",
+                message=None,
+                started_utc=started_utc,
+                ended_utc=ended_utc,
+                duration_ms=duration_ms,
             )
 
         logger.log_module_summary(
@@ -253,7 +323,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             expected_written=1,
             written=1,
             status="OK",
-            duration_s=time.monotonic() - start,
+            duration_s=time.monotonic() - t0,
         )
         return True
 

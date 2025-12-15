@@ -16,6 +16,47 @@ from centaur.watcher import FileReadyEvent
 MODULE_NAME = "flat_basic_worker"
 
 
+def utc_now() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _insert_module_run(
+    db: Database,
+    image_id: int,
+    *,
+    expected_read: int,
+    read: int,
+    written: int,
+    status: str,
+    message: Optional[str],
+    started_utc: str,
+    ended_utc: str,
+    duration_ms: int,
+) -> None:
+    db.execute(
+        """
+        INSERT INTO module_runs
+        (image_id, module_name, expected_fields, read_fields, written_fields,
+         status, message, started_utc, ended_utc, duration_ms, db_written_utc)
+        VALUES (?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            image_id,
+            MODULE_NAME,
+            expected_read,
+            read,
+            written,
+            status,
+            message,
+            started_utc,
+            ended_utc,
+            duration_ms,
+            utc_now(),
+        ),
+    )
+
+
 def _is_flat(hdr) -> bool:
     return str(hdr.get("IMAGETYP", "")).strip().upper() == "FLAT"
 
@@ -31,7 +72,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
       True  -> success or not-applicable (non-flat)
       False -> failure
     """
-    start = time.monotonic()
+    t0 = time.monotonic()
+    started_utc = utc_now()
     file_path = str(event.file_path)
 
     try:
@@ -61,13 +103,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         minv = float(np.min(arr))
         maxv = float(np.max(arr))
 
-        # Clip fractions (basic; we can refine later once we standardize bit depth behavior)
-        # We use robust percentiles so we don't need exact saturation ADU here.
+        # Clip fractions (robust percentile-based)
         p01 = float(np.percentile(arr, 1))
         p99 = float(np.percentile(arr, 99))
-
-        # Treat values at/below p01 as "low-clipped-ish" and at/above p99 as "high-clipped-ish"
-        # (This gives a consistent signal even when we don't know the camera's true max ADU.)
         clipped_low = float(np.mean(arr <= p01))
         clipped_high = float(np.mean(arr >= p99))
 
@@ -91,14 +129,13 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         grad_mag = np.sqrt(gx * gx + gy * gy)
         grad_p95 = float(np.percentile(grad_mag, 95))
 
-        # Basic usability heuristic (v1; strict pass/fail comes later)
+        # Basic usability heuristic (v1)
         usable = int(
             (median > 0) and
             (clipped_high < 0.02) and
             (clipped_low < 0.02)
         )
 
-        # Write to DB (needs image_id from images table)
         with Database().transaction() as db:
             row = db.execute(
                 "SELECT image_id FROM images WHERE file_path = ?",
@@ -136,8 +173,25 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     clipped_low, clipped_high,
                     corner_vignette_frac, grad_p95,
                     usable,
-                    datetime.now(timezone.utc).isoformat(),
+                    utc_now(),
                 ),
+            )
+
+            ended_utc = utc_now()
+            duration_ms = int((time.monotonic() - t0) * 1000)
+
+            # module_runs audit (so sanity can mark FLAT modules OK)
+            _insert_module_run(
+                db,
+                image_id,
+                expected_read=1,
+                read=1,
+                written=1,
+                status="ok",
+                message=None,
+                started_utc=started_utc,
+                ended_utc=ended_utc,
+                duration_ms=duration_ms,
             )
 
         logger.log_module_summary(
@@ -148,7 +202,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             expected_written=1,
             written=1,
             status="OK",
-            duration_s=time.monotonic() - start,
+            duration_s=time.monotonic() - t0,
         )
         return True
 
