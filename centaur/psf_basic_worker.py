@@ -1,7 +1,7 @@
-
 from __future__ import annotations
 
 import csv
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -407,6 +407,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         n_rej_cutout = 0
         n_rej_measure = 0
 
+        # NEW: track exactly which stars we successfully measured (full-frame coords)
+        measured_xy: List[Tuple[int, int]] = []
+
         # If max_stars_measured is set, take the brightest good peaks (good_peaks is already bright-sorted)
         to_measure = good_peaks
         if max_stars_measured > 0 and len(to_measure) > max_stars_measured:
@@ -429,11 +432,15 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             ecc_vals.append(ecc)
             theta_vals.append(theta)
 
+            fx = int(p.x + x0)
+            fy = int(p.y + y0)
+            measured_xy.append((fx, fy))
+
             if getattr(cfg, "psf1_debug_dump_measurements_csv", False):
                 per_star_rows.append(
                     {
-                        "x": int(p.x + x0),
-                        "y": int(p.y + y0),
+                        "x": fx,
+                        "y": fy,
                         "hfr_px": float(hfr),
                         "fwhm_px": float(fwhm),
                         "ecc": float(ecc),
@@ -443,8 +450,11 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
 
         n_measured = int(len(hfr_vals))
 
+        # NEW: JSON list of the *measured* stars only (PSF-2 should consume this)
+        # Keep it simple: list of {x,y}
+        star_xy_json = json.dumps([{"x": x, "y": y} for (x, y) in measured_xy]) if measured_xy else "[]"
+
         # Angular summary: keep it simple and robust
-        # We'll store median(theta) and p90(|theta - median|)
         theta_med = _pct(theta_vals, 50)
         theta_p90abs = None
         if theta_med is not None and theta_vals:
@@ -482,6 +492,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             "ecc_p90": _pct(ecc_vals, 90),
             "theta_rad_median": theta_med,
             "theta_rad_p90abs": theta_p90abs,
+            "star_xy_json": star_xy_json,
             "usable": usable,
             "reason": reason,
         }
@@ -512,6 +523,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                   ecc_median, ecc_p90,
                   theta_rad_median, theta_rad_p90abs,
 
+                  star_xy_json,
+
                   usable, reason
                 ) VALUES (
                   ?,
@@ -527,6 +540,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                   ?, ?, ?,
                   ?, ?,
                   ?, ?,
+
+                  ?,
 
                   ?, ?
                 )
@@ -545,6 +560,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     fields["fwhm_px_median"], fields["fwhm_px_p10"], fields["fwhm_px_p90"],
                     fields["ecc_median"], fields["ecc_p90"],
                     fields["theta_rad_median"], fields["theta_rad_p90abs"],
+
+                    fields["star_xy_json"],
 
                     fields["usable"], fields["reason"],
                 ),

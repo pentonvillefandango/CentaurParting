@@ -57,6 +57,7 @@ class AppConfig:
             "flat_group_worker": True,
             "psf_detect_worker": True,
             "psf_basic_worker": True,
+            "psf_model_worker": True,
         }
     )
 
@@ -65,14 +66,18 @@ class AppConfig:
     psf_roi_fraction: float = 0.5
     psf_threshold_sigma: float = 8.0
     psf_min_separation_px: int = 8
-    psf_max_stars: int = 20000
+    psf_max_stars: int = 0
     psf_edge_margin_px: int = 16
     psf_debug_dump_candidates_csv: bool = False
     psf_good_extra_sigma: float = 8.0
     psf_cutout_radius_px: int = 8
     psf1_max_stars_measured: int = 0  # 0 = unlimited
     psf1_debug_dump_measurements_csv: bool = False
-
+    psf2_enabled: bool = True
+    psf2_max_stars: int = 0
+    psf2_fit_radius_px: int = 8
+    psf2_models: list[str] = field(default_factory=lambda: ["gaussian", "moffat"])
+    psf2_min_good_fits = 50
 
 
     def is_module_enabled(self, module_name: str) -> bool:
@@ -97,8 +102,10 @@ def default_config() -> AppConfig:
                 "sky_basic_worker": False,# Example: "fits_header_worker": True
                 "exposure_advice_worker": False,
                 "sky_background2d_worker": False,
-                "psf_detect_worker": False,
+                "psf_detect_worker": True,
                 "psf_basic_worker": False,
+                "psf_model_worker": True,
+
 
             },
         ),

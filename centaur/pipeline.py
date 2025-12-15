@@ -32,6 +32,7 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
     from centaur.flat_group_worker import process_file_event as flat_group_process
     from centaur.psf_detect_worker import process_file_event as psf_detect_process
     from centaur.psf_basic_worker import process_file_event as psf_basic_process
+    from centaur.psf_model_worker import process_file_event as psf_model_process
 
 
 
@@ -55,6 +56,7 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
         # PSF layer
         "psf_detect_worker": psf_detect_process,
         "psf_basic_worker": psf_basic_process,
+        "psf_model_worker": psf_model_process,
     }
 
 
@@ -124,7 +126,7 @@ def run_pipeline_for_event(
         _run_one(cfg, logger, event, registry, result, "flat_basic_worker")
 
         # Light-only modules not applicable for flats
-        for name in ("sky_basic_worker", "sky_background2d_worker", "exposure_advice_worker", "psf_detect_worker", "psf_basic_worker"):
+        for name in ("sky_basic_worker", "sky_background2d_worker", "exposure_advice_worker", "psf_detect_worker", "psf_basic_worker", "psf_model_worker"):
             if cfg.is_module_enabled(name):
                 result.skipped += 1
 
@@ -136,7 +138,7 @@ def run_pipeline_for_event(
         if cfg.is_module_enabled(name):
             result.skipped += 1
 
-    for name in ("sky_basic_worker", "sky_background2d_worker", "exposure_advice_worker", "psf_detect_worker", "psf_basic_worker"):
+    for name in ("sky_basic_worker", "sky_background2d_worker", "exposure_advice_worker", "psf_detect_worker", "psf_basic_worker", "psf_model_worker"):
         _run_one(cfg, logger, event, registry, result, name)
 
     return result
