@@ -24,12 +24,29 @@ CREATE TABLE IF NOT EXISTS psf_grid_metrics (
   n_input_stars INTEGER NOT NULL,
   n_cells_with_data INTEGER NOT NULL,
 
-  -- rollups
+  -- rollups (existing)
   center_fwhm_px REAL,
   corner_fwhm_px_median REAL,
   center_to_corner_fwhm_ratio REAL,
   left_right_fwhm_ratio REAL,
   top_bottom_fwhm_ratio REAL,
+
+  -- NEW: FWHM field rollups
+  fwhm_cell_median_overall REAL,
+  fwhm_cell_iqr_overall REAL,
+  fwhm_cell_min REAL,
+  fwhm_cell_max REAL,
+  fwhm_cell_range REAL,
+  fwhm_center_minus_corner REAL,
+  fwhm_left_right_delta REAL,
+  fwhm_top_bottom_delta REAL,
+
+  -- NEW: ECC field rollups
+  ecc_cell_median_overall REAL,
+  ecc_cell_max REAL,
+  ecc_center REAL,
+  ecc_corners_median REAL,
+  ecc_center_minus_corners REAL,
 
   -- per-cell summaries (3x3)
   cell_r0c0_n INTEGER NOT NULL,

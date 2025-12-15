@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import time
@@ -35,6 +34,17 @@ def _median(vals: List[float]) -> Optional[float]:
     if not vals:
         return None
     return _safe_float(float(np.median(np.asarray(vals, dtype=np.float64))))
+
+
+def _iqr(vals: List[float]) -> Optional[float]:
+    if not vals:
+        return None
+    a = np.asarray(vals, dtype=np.float64)
+    if a.size == 0:
+        return None
+    q75 = float(np.percentile(a, 75))
+    q25 = float(np.percentile(a, 25))
+    return _safe_float(q75 - q25)
 
 
 def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
@@ -92,7 +102,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
     t0 = time.monotonic()
     started_utc = utc_now()
 
-    # Defaults (v1)
     grid_rows = 3
     grid_cols = 3
     min_stars_per_cell = int(getattr(cfg, "psf_grid_min_stars_per_cell", 10))
@@ -151,7 +160,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
 
         n_input_stars = int(len(acc_xy))
 
-        # Too few stars overall
         if n_input_stars < 25:
             row = _build_empty_row(
                 grid_rows=grid_rows,
@@ -179,7 +187,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             cell_f[r][c].append(float(f))
             cell_e[r][c].append(float(e))
 
-        # Compute cell medians with min-stars rule
+        # Cell medians (min-stars rule)
         cell_n = [[len(cell_f[r][c]) for c in range(grid_cols)] for r in range(grid_rows)]
         cell_f_med: List[List[Optional[float]]] = [[None for _ in range(grid_cols)] for _ in range(grid_rows)]
         cell_e_med: List[List[Optional[float]]] = [[None for _ in range(grid_cols)] for _ in range(grid_rows)]
@@ -193,26 +201,63 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
                     if cell_f_med[r][c] is not None:
                         n_cells_with_data += 1
 
-        # Rollups
+        # Existing rollups
         center = cell_f_med[1][1]
         corners = [cell_f_med[0][0], cell_f_med[0][2], cell_f_med[2][0], cell_f_med[2][2]]
         corners_ok = [v for v in corners if v is not None]
         corner_med = _median([float(v) for v in corners_ok]) if len(corners_ok) >= 2 else None
 
-        def side_med(vals: List[Optional[float]]) -> Optional[float]:
+        def _side_med(vals: List[Optional[float]]) -> Optional[float]:
             ok = [v for v in vals if v is not None]
             return _median([float(v) for v in ok]) if ok else None
 
-        left_med = side_med([cell_f_med[0][0], cell_f_med[1][0], cell_f_med[2][0]])
-        right_med = side_med([cell_f_med[0][2], cell_f_med[1][2], cell_f_med[2][2]])
-        top_med = side_med([cell_f_med[0][0], cell_f_med[0][1], cell_f_med[0][2]])
-        bot_med = side_med([cell_f_med[2][0], cell_f_med[2][1], cell_f_med[2][2]])
+        left_med = _side_med([cell_f_med[0][0], cell_f_med[1][0], cell_f_med[2][0]])
+        right_med = _side_med([cell_f_med[0][2], cell_f_med[1][2], cell_f_med[2][2]])
+        top_med = _side_med([cell_f_med[0][0], cell_f_med[0][1], cell_f_med[0][2]])
+        bot_med = _side_med([cell_f_med[2][0], cell_f_med[2][1], cell_f_med[2][2]])
 
         center_to_corner = (center / corner_med) if (center is not None and corner_med is not None and corner_med > 0) else None
         left_right = (left_med / right_med) if (left_med is not None and right_med is not None and right_med > 0) else None
         top_bottom = (top_med / bot_med) if (top_med is not None and bot_med is not None and bot_med > 0) else None
 
-        # Usable decision
+        # NEW: FWHM rollups across cells (using available cell medians only)
+        fwhm_cells: List[float] = []
+        for r in range(grid_rows):
+            for c in range(grid_cols):
+                v = cell_f_med[r][c]
+                if v is None:
+                    continue
+                fwhm_cells.append(float(v))
+
+        fwhm_cell_median_overall = _median(fwhm_cells)
+        fwhm_cell_iqr_overall = _iqr(fwhm_cells)
+        fwhm_cell_min = _safe_float(min(fwhm_cells)) if fwhm_cells else None
+        fwhm_cell_max = _safe_float(max(fwhm_cells)) if fwhm_cells else None
+        fwhm_cell_range = (fwhm_cell_max - fwhm_cell_min) if (fwhm_cell_max is not None and fwhm_cell_min is not None) else None
+
+        fwhm_center_minus_corner = (center - corner_med) if (center is not None and corner_med is not None) else None
+        fwhm_left_right_delta = (right_med - left_med) if (right_med is not None and left_med is not None) else None
+        fwhm_top_bottom_delta = (bot_med - top_med) if (bot_med is not None and top_med is not None) else None
+
+        # NEW: ECC rollups across cells
+        ecc_cells: List[float] = []
+        for r in range(grid_rows):
+            for c in range(grid_cols):
+                v = cell_e_med[r][c]
+                if v is None:
+                    continue
+                ecc_cells.append(float(v))
+
+        ecc_cell_median_overall = _median(ecc_cells)
+        ecc_cell_max = _safe_float(max(ecc_cells)) if ecc_cells else None
+
+        ecc_center = cell_e_med[1][1]
+        ecc_corners = [cell_e_med[0][0], cell_e_med[0][2], cell_e_med[2][0], cell_e_med[2][2]]
+        ecc_corners_ok = [v for v in ecc_corners if v is not None]
+        ecc_corners_median = _median([float(v) for v in ecc_corners_ok]) if len(ecc_corners_ok) >= 2 else None
+        ecc_center_minus_corners = (ecc_center - ecc_corners_median) if (ecc_center is not None and ecc_corners_median is not None) else None
+
+        # Usable decision (unchanged)
         if n_cells_with_data < 3:
             usable = 0
             reason = "too_few_cells_with_data"
@@ -224,7 +269,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
         row = {
             "image_id": image_id,
 
-            "expected_fields": 0,  # filled after we count
+            "expected_fields": 0,
             "read_fields": 0,
             "written_fields": 0,
             "parse_warnings": None,
@@ -237,11 +282,28 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             "n_input_stars": n_input_stars,
             "n_cells_with_data": int(n_cells_with_data),
 
+            # existing rollups
             "center_fwhm_px": center,
             "corner_fwhm_px_median": corner_med,
             "center_to_corner_fwhm_ratio": center_to_corner,
             "left_right_fwhm_ratio": left_right,
             "top_bottom_fwhm_ratio": top_bottom,
+
+            # new rollups
+            "fwhm_cell_median_overall": fwhm_cell_median_overall,
+            "fwhm_cell_iqr_overall": fwhm_cell_iqr_overall,
+            "fwhm_cell_min": fwhm_cell_min,
+            "fwhm_cell_max": fwhm_cell_max,
+            "fwhm_cell_range": fwhm_cell_range,
+            "fwhm_center_minus_corner": fwhm_center_minus_corner,
+            "fwhm_left_right_delta": fwhm_left_right_delta,
+            "fwhm_top_bottom_delta": fwhm_top_bottom_delta,
+
+            "ecc_cell_median_overall": ecc_cell_median_overall,
+            "ecc_cell_max": ecc_cell_max,
+            "ecc_center": ecc_center,
+            "ecc_corners_median": ecc_corners_median,
+            "ecc_center_minus_corners": ecc_center_minus_corners,
 
             # cells
             "cell_r0c0_n": int(cell_n[0][0]), "cell_r0c0_fwhm_px_median": cell_f_med[0][0], "cell_r0c0_ecc_median": cell_e_med[0][0],
@@ -284,6 +346,15 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             "center_to_corner_fwhm_ratio": center_to_corner,
             "left_right_fwhm_ratio": left_right,
             "top_bottom_fwhm_ratio": top_bottom,
+            "fwhm_cell_median_overall": fwhm_cell_median_overall,
+            "fwhm_cell_iqr_overall": fwhm_cell_iqr_overall,
+            "fwhm_cell_range": fwhm_cell_range,
+            "fwhm_left_right_delta": fwhm_left_right_delta,
+            "fwhm_top_bottom_delta": fwhm_top_bottom_delta,
+            "ecc_cell_median_overall": ecc_cell_median_overall,
+            "ecc_cell_max": ecc_cell_max,
+            "ecc_center": ecc_center,
+            "ecc_corners_median": ecc_corners_median,
             "usable": int(usable),
             "reason": str(reason),
         }
@@ -296,8 +367,16 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
                   expected_fields, read_fields, written_fields, parse_warnings, db_written_utc,
                   grid_rows, grid_cols, grid_min_stars_per_cell,
                   n_input_stars, n_cells_with_data,
+
                   center_fwhm_px, corner_fwhm_px_median, center_to_corner_fwhm_ratio,
                   left_right_fwhm_ratio, top_bottom_fwhm_ratio,
+
+                  fwhm_cell_median_overall, fwhm_cell_iqr_overall,
+                  fwhm_cell_min, fwhm_cell_max, fwhm_cell_range,
+                  fwhm_center_minus_corner, fwhm_left_right_delta, fwhm_top_bottom_delta,
+
+                  ecc_cell_median_overall, ecc_cell_max, ecc_center,
+                  ecc_corners_median, ecc_center_minus_corners,
 
                   cell_r0c0_n, cell_r0c0_fwhm_px_median, cell_r0c0_ecc_median,
                   cell_r0c1_n, cell_r0c1_fwhm_px_median, cell_r0c1_ecc_median,
@@ -317,6 +396,14 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
                   ?, ?, ?, ?, ?,
                   ?, ?, ?,
                   ?, ?,
+
+                  ?, ?, ?,
+                  ?, ?,
+
+                  ?, ?,
+                  ?, ?, ?,
+                  ?, ?, ?,
+
                   ?, ?, ?,
                   ?, ?,
 
@@ -340,8 +427,16 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
                     row["expected_fields"], row["read_fields"], row["written_fields"], row["parse_warnings"], row["db_written_utc"],
                     row["grid_rows"], row["grid_cols"], row["grid_min_stars_per_cell"],
                     row["n_input_stars"], row["n_cells_with_data"],
+
                     row["center_fwhm_px"], row["corner_fwhm_px_median"], row["center_to_corner_fwhm_ratio"],
                     row["left_right_fwhm_ratio"], row["top_bottom_fwhm_ratio"],
+
+                    row["fwhm_cell_median_overall"], row["fwhm_cell_iqr_overall"],
+                    row["fwhm_cell_min"], row["fwhm_cell_max"], row["fwhm_cell_range"],
+                    row["fwhm_center_minus_corner"], row["fwhm_left_right_delta"], row["fwhm_top_bottom_delta"],
+
+                    row["ecc_cell_median_overall"], row["ecc_cell_max"], row["ecc_center"],
+                    row["ecc_corners_median"], row["ecc_center_minus_corners"],
 
                     row["cell_r0c0_n"], row["cell_r0c0_fwhm_px_median"], row["cell_r0c0_ecc_median"],
                     row["cell_r0c1_n"], row["cell_r0c1_fwhm_px_median"], row["cell_r0c1_ecc_median"],
@@ -409,14 +504,32 @@ def _build_empty_row(*, grid_rows: int, grid_cols: int, min_stars_per_cell: int,
         "grid_min_stars_per_cell": int(min_stars_per_cell),
         "n_input_stars": int(n_input_stars),
         "n_cells_with_data": 0,
+
         "center_fwhm_px": None,
         "corner_fwhm_px_median": None,
         "center_to_corner_fwhm_ratio": None,
         "left_right_fwhm_ratio": None,
         "top_bottom_fwhm_ratio": None,
+
+        "fwhm_cell_median_overall": None,
+        "fwhm_cell_iqr_overall": None,
+        "fwhm_cell_min": None,
+        "fwhm_cell_max": None,
+        "fwhm_cell_range": None,
+        "fwhm_center_minus_corner": None,
+        "fwhm_left_right_delta": None,
+        "fwhm_top_bottom_delta": None,
+
+        "ecc_cell_median_overall": None,
+        "ecc_cell_max": None,
+        "ecc_center": None,
+        "ecc_corners_median": None,
+        "ecc_center_minus_corners": None,
+
         "usable": 0,
         "reason": str(reason),
     }
+
     for r in range(3):
         for c in range(3):
             row[f"cell_r{r}c{c}_n"] = 0
@@ -448,8 +561,16 @@ def _write_row_and_log(
               expected_fields, read_fields, written_fields, parse_warnings, db_written_utc,
               grid_rows, grid_cols, grid_min_stars_per_cell,
               n_input_stars, n_cells_with_data,
+
               center_fwhm_px, corner_fwhm_px_median, center_to_corner_fwhm_ratio,
               left_right_fwhm_ratio, top_bottom_fwhm_ratio,
+
+              fwhm_cell_median_overall, fwhm_cell_iqr_overall,
+              fwhm_cell_min, fwhm_cell_max, fwhm_cell_range,
+              fwhm_center_minus_corner, fwhm_left_right_delta, fwhm_top_bottom_delta,
+
+              ecc_cell_median_overall, ecc_cell_max, ecc_center,
+              ecc_corners_median, ecc_center_minus_corners,
 
               cell_r0c0_n, cell_r0c0_fwhm_px_median, cell_r0c0_ecc_median,
               cell_r0c1_n, cell_r0c1_fwhm_px_median, cell_r0c1_ecc_median,
@@ -469,6 +590,14 @@ def _write_row_and_log(
               ?, ?, ?, ?, ?,
               ?, ?, ?,
               ?, ?,
+
+              ?, ?, ?,
+              ?, ?,
+
+              ?, ?,
+              ?, ?, ?,
+              ?, ?, ?,
+
               ?, ?, ?,
               ?, ?,
 
@@ -492,8 +621,16 @@ def _write_row_and_log(
                 row["expected_fields"], row["read_fields"], row["written_fields"], row["parse_warnings"], row["db_written_utc"],
                 row["grid_rows"], row["grid_cols"], row["grid_min_stars_per_cell"],
                 row["n_input_stars"], row["n_cells_with_data"],
+
                 row["center_fwhm_px"], row["corner_fwhm_px_median"], row["center_to_corner_fwhm_ratio"],
                 row["left_right_fwhm_ratio"], row["top_bottom_fwhm_ratio"],
+
+                row["fwhm_cell_median_overall"], row["fwhm_cell_iqr_overall"],
+                row["fwhm_cell_min"], row["fwhm_cell_max"], row["fwhm_cell_range"],
+                row["fwhm_center_minus_corner"], row["fwhm_left_right_delta"], row["fwhm_top_bottom_delta"],
+
+                row["ecc_cell_median_overall"], row["ecc_cell_max"], row["ecc_center"],
+                row["ecc_corners_median"], row["ecc_center_minus_corners"],
 
                 row["cell_r0c0_n"], row["cell_r0c0_fwhm_px_median"], row["cell_r0c0_ecc_median"],
                 row["cell_r0c1_n"], row["cell_r0c1_fwhm_px_median"], row["cell_r0c1_ecc_median"],
