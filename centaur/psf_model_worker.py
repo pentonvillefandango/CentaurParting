@@ -57,10 +57,6 @@ def _fetch_psf1_summary(db: Database, image_id: int) -> Tuple[int, int]:
 
 
 def _fetch_psf1_star_xy(db: Database, image_id: int) -> List[Tuple[int, int]]:
-    """
-    Returns list of (x,y) integer positions from psf_basic_metrics.star_xy_json.
-    If missing/empty/unparseable, returns [].
-    """
     row = db.execute(
         "SELECT star_xy_json FROM psf_basic_metrics WHERE image_id = ?",
         (image_id,),
@@ -108,14 +104,15 @@ def _insert_module_run(
     started_utc: str,
     ended_utc: str,
     duration_ms: int,
+    duration_us: int,
 ) -> None:
     db.execute(
         """
         INSERT INTO module_runs
         (image_id, module_name, expected_fields, read_fields, written_fields,
-         status, message, started_utc, ended_utc, duration_ms, db_written_utc)
+         status, message, started_utc, ended_utc, duration_ms, duration_us, db_written_utc)
         VALUES (?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?)
+                ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             image_id,
@@ -128,16 +125,13 @@ def _insert_module_run(
             started_utc,
             ended_utc,
             duration_ms,
+            duration_us,
             utc_now(),
         ),
     )
 
 
 def _moment_gaussian_equiv(data: np.ndarray) -> Optional[Tuple[float, float]]:
-    """
-    Gaussian-equivalent sigma_x, sigma_y using second moments.
-    Assumes background-subtracted-ish; uses positive flux only.
-    """
     data_pos = np.clip(data, 0.0, None)
     flux = float(np.sum(data_pos))
     if not np.isfinite(flux) or flux <= 0:
@@ -160,23 +154,17 @@ def _moment_gaussian_equiv(data: np.ndarray) -> Optional[Tuple[float, float]]:
 
 
 def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Optional[bool]:
-    """
-    PSF-2: model summary from PSF-1 star positions.
-    """
     t0 = time.monotonic()
     started_utc = utc_now()
 
-    # Config
     max_stars_cfg = int(getattr(cfg, "psf2_max_stars", 1000))  # 0 = unlimited
     fit_radius = int(getattr(cfg, "psf2_fit_radius_px", 8))
     edge_margin = int(getattr(cfg, "psf2_edge_margin_px", 16))
     min_good_fits = int(getattr(cfg, "psf2_min_good_fits", 50))
 
-    # Interpret max_stars=0 as unlimited
     max_stars = 0 if max_stars_cfg <= 0 else max_stars_cfg
 
     try:
-        # Resolve image_id and PSF-1 usability + star list
         with Database().transaction() as db:
             image_id = _get_image_id(db, event.file_path)
             if image_id is None:
@@ -185,10 +173,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             n_input, psf1_usable = _fetch_psf1_summary(db, image_id)
             star_xy = _fetch_psf1_star_xy(db, image_id)
 
-        # Gate on PSF-1
         expected_fields = 10
         if psf1_usable != 1 or n_input < 25 or not star_xy:
-            # If PSF-1 didn't give us a usable list, skip cleanly
             fields = {
                 "n_input_stars": n_input,
                 "n_modeled": 0,
@@ -239,6 +225,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     ),
                 )
 
+                duration_us = int((time.monotonic() - t0) * 1_000_000)
+                duration_ms = int(duration_us // 1000)
+
                 _insert_module_run(
                     db,
                     image_id,
@@ -249,7 +238,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     message="skipped_psf2",
                     started_utc=started_utc,
                     ended_utc=utc_now(),
-                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    duration_ms=duration_ms,
+                    duration_us=duration_us,
                 )
 
             logger.log_module_result(
@@ -265,11 +255,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             )
             return None
 
-        # Optionally cap number of stars (but still obey PSF-1 selection)
         if max_stars > 0 and len(star_xy) > max_stars:
             star_xy = star_xy[:max_stars]
 
-        # Load image
         with fits.open(str(event.file_path), memmap=False) as hdul:
             img = np.asarray(hdul[0].data, dtype=np.float64)
 
@@ -287,7 +275,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         n_gauss_ok = 0
 
         for (x, y) in star_xy:
-            # Edge margin (extra safety)
             if x < edge_margin or y < edge_margin or x >= (w - edge_margin) or y >= (h - edge_margin):
                 continue
 
@@ -300,7 +287,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             if stamp.size < 25 or not np.isfinite(stamp).any():
                 continue
 
-            # subtract local background
             local_bg = float(np.nanmedian(stamp))
             data = stamp - local_bg
             if not np.isfinite(data).all():
@@ -354,14 +340,13 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             "moffat_fwhm_px_median": None,
             "moffat_beta_median": None,
             "moffat_residual_median": None,
-            # logged-only debug
             "n_fit_attempted": n_fit_attempted,
             "n_gauss_ok": n_gauss_ok,
             "psf2_max_stars_used": max_stars,
             "psf2_min_good_fits": min_good_fits,
         }
 
-        written_fields = 2  # n_input_stars, n_modeled
+        written_fields = 2
         for k in ("gauss_fwhm_px_median", "gauss_fwhm_px_iqr", "gauss_fwhm_px_p90", "gauss_ecc_median"):
             if fields[k] is not None:
                 written_fields += 1
@@ -403,6 +388,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 ),
             )
 
+            duration_us = int((time.monotonic() - t0) * 1_000_000)
+            duration_ms = int(duration_us // 1000)
+
             _insert_module_run(
                 db,
                 image_id,
@@ -413,7 +401,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 message=None,
                 started_utc=started_utc,
                 ended_utc=utc_now(),
-                duration_ms=int((time.monotonic() - t0) * 1000),
+                duration_ms=duration_ms,
+                duration_us=duration_us,
             )
 
         logger.log_module_result(

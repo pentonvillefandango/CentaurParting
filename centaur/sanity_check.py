@@ -1,6 +1,17 @@
 # ---------------------------------------------
 # how to run
-# python3 centaur/sanity_check.py --db data/centaurparting.db --out data/sanity_report3.csv --summary data/sanity_summary3.json
+# python3 centaur/sanity_check.py --db data/centaurparting.db
+#
+# (optional explicit paths)
+# python3 centaur/sanity_check.py --db data/centaurparting.db \
+#   --out data/sanity_report.csv \
+#   --summary data/sanity_summary.json \
+#   --perf data/sanity_performance.csv
+#
+# outputs (default if you omit --out/--summary/--perf):
+#   data/sanity_report_YYYYMMDD_HHMMSS.csv
+#   data/sanity_summary_YYYYMMDD_HHMMSS.json
+#   data/sanity_performance_YYYYMMDD_HHMMSS.csv
 # ---------------------------------------------
 
 from __future__ import annotations
@@ -10,6 +21,7 @@ import csv
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,6 +29,10 @@ from typing import Any, Dict, List, Optional, Tuple
 # -----------------------------
 # Helpers
 # -----------------------------
+
+def _now_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
@@ -28,6 +44,14 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     r = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone()
+    return bool(r)
+
+
+def _view_exists(conn: sqlite3.Connection, name: str) -> bool:
+    r = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='view' AND name=?",
         (name,),
     ).fetchone()
     return bool(r)
@@ -54,10 +78,6 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
-def _is_finite(v: Optional[float]) -> bool:
-    return v is not None and (v == v) and (v != float("inf")) and (v != float("-inf"))
-
-
 def _clamp01(v: Optional[float]) -> bool:
     if v is None:
         return True
@@ -75,10 +95,9 @@ def _median(vals: List[float]) -> Optional[float]:
     return 0.5 * (s[mid - 1] + s[mid])
 
 
-def _approx_equal(a: Optional[float], b: Optional[float], tol: float = 1e-6) -> bool:
-    if a is None or b is None:
-        return False
-    return abs(a - b) <= tol
+def _append_anom(anoms: List[str], msg: str) -> None:
+    if msg and msg not in anoms:
+        anoms.append(msg)
 
 
 # -----------------------------
@@ -117,32 +136,33 @@ class ImageRow:
     psf2_gauss_fwhm_p90: Optional[float] = None
     psf2_gauss_ecc_med: Optional[float] = None
 
-    # PSF grid key rollups (existing)
+    # PSF grid key rollups
     psf_grid_n_input_stars: Optional[int] = None
     psf_grid_n_cells_with_data: Optional[int] = None
     psf_grid_center_fwhm_px: Optional[float] = None
     psf_grid_corner_fwhm_px_median: Optional[float] = None
     psf_grid_center_to_corner_ratio: Optional[float] = None
 
-    # PSF grid NEW rollups (latest)
-    psf_grid_fwhm_cell_median_overall: Optional[float] = None
-    psf_grid_fwhm_cell_iqr_overall: Optional[float] = None
-    psf_grid_fwhm_cell_range: Optional[float] = None
-    psf_grid_fwhm_center_minus_corner: Optional[float] = None
-    psf_grid_ecc_cell_median_overall: Optional[float] = None
-    psf_grid_ecc_center_minus_corners: Optional[float] = None
-
-    # performance
-    psf2_duration_ms: Optional[int] = None
-    psf2_ms_per_star: Optional[float] = None
+    # performance (from module_runs)
+    fits_duration_ms: Optional[int] = None
+    sky_basic_duration_ms: Optional[int] = None
+    sky_bkg2d_duration_ms: Optional[int] = None
+    exposure_duration_ms: Optional[int] = None
+    flat_group_duration_ms: Optional[int] = None
+    flat_basic_duration_ms: Optional[int] = None
+    psf0_duration_ms: Optional[int] = None
+    psf1_duration_ms: Optional[int] = None
     psf_grid_duration_ms: Optional[int] = None
+    psf2_duration_ms: Optional[int] = None
+
+    psf2_ms_per_star: Optional[float] = None
 
     # anomalies
     anomalies: str = ""
 
 
 # -----------------------------
-# Sanity checks
+# Sanity checks (metrics tables)
 # -----------------------------
 
 def _fetch_images(conn: sqlite3.Connection) -> List[sqlite3.Row]:
@@ -178,11 +198,6 @@ def _module_run_ok_map(conn: sqlite3.Connection) -> Dict[Tuple[int, str], int]:
         st = str(r["status"] or "").lower()
         out[key] = 1 if st == "ok" else 0
     return out
-
-
-def _append_anom(anoms: List[str], msg: str) -> None:
-    if msg and msg not in anoms:
-        anoms.append(msg)
 
 
 def _check_fits_header(row: ImageRow, anoms: List[str]) -> None:
@@ -299,6 +314,7 @@ def _check_psf1(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> No
     if usable == 0 and reason == "ok":
         _append_anom(anoms, "psf1_not_usable_but_reason_ok")
 
+    # light validation of star_xy_json shape
     star_json = r["star_xy_json"]
     if star_json is not None:
         try:
@@ -319,49 +335,30 @@ def _check_psf1(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> No
 def _check_psf_grid(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> None:
     if not _table_exists(conn, "psf_grid_metrics"):
         return
+    r = conn.execute(
+        """
+        SELECT
+          grid_rows,
+          grid_cols,
+          grid_min_stars_per_cell,
+          n_input_stars,
+          n_cells_with_data,
+          center_fwhm_px,
+          corner_fwhm_px_median,
+          center_to_corner_fwhm_ratio,
+          left_right_fwhm_ratio,
+          top_bottom_fwhm_ratio,
+          usable,
+          reason,
 
-    # We want to support both:
-    # - older psf_grid_metrics schema (no new rollup cols)
-    # - latest schema (with new rollup cols)
-    has_new = _col_exists(conn, "psf_grid_metrics", "fwhm_cell_median_overall")
-
-    select_cols = [
-        "grid_rows",
-        "grid_cols",
-        "grid_min_stars_per_cell",
-        "n_input_stars",
-        "n_cells_with_data",
-        "center_fwhm_px",
-        "corner_fwhm_px_median",
-        "center_to_corner_fwhm_ratio",
-        "left_right_fwhm_ratio",
-        "top_bottom_fwhm_ratio",
-        "usable",
-        "reason",
-        "cell_r0c0_n", "cell_r0c1_n", "cell_r0c2_n",
-        "cell_r1c0_n", "cell_r1c1_n", "cell_r1c2_n",
-        "cell_r2c0_n", "cell_r2c1_n", "cell_r2c2_n",
-    ]
-
-    if has_new:
-        select_cols.extend([
-            "fwhm_cell_median_overall",
-            "fwhm_cell_iqr_overall",
-            "fwhm_cell_min",
-            "fwhm_cell_max",
-            "fwhm_cell_range",
-            "fwhm_center_minus_corner",
-            "fwhm_left_right_delta",
-            "fwhm_top_bottom_delta",
-            "ecc_cell_median_overall",
-            "ecc_cell_max",
-            "ecc_center",
-            "ecc_corners_median",
-            "ecc_center_minus_corners",
-        ])
-
-    sql = f"SELECT {', '.join(select_cols)} FROM psf_grid_metrics WHERE image_id=?"
-    r = conn.execute(sql, (row.image_id,)).fetchone()
+          cell_r0c0_n, cell_r0c1_n, cell_r0c2_n,
+          cell_r1c0_n, cell_r1c1_n, cell_r1c2_n,
+          cell_r2c0_n, cell_r2c1_n, cell_r2c2_n
+        FROM psf_grid_metrics
+        WHERE image_id=?
+        """,
+        (row.image_id,),
+    ).fetchone()
     if not r:
         _append_anom(anoms, "psf_grid_missing_row")
         return
@@ -407,73 +404,6 @@ def _check_psf_grid(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -
     if usable == 0 and reason == "ok":
         _append_anom(anoms, "psf_grid_not_usable_but_reason_ok")
 
-    # ---------
-    # NEW rollup checks (only if schema has them)
-    # ---------
-    if has_new:
-        f_med = _safe_float(r["fwhm_cell_median_overall"])
-        f_iqr = _safe_float(r["fwhm_cell_iqr_overall"])
-        f_min = _safe_float(r["fwhm_cell_min"])
-        f_max = _safe_float(r["fwhm_cell_max"])
-        f_rng = _safe_float(r["fwhm_cell_range"])
-
-        row.psf_grid_fwhm_cell_median_overall = f_med
-        row.psf_grid_fwhm_cell_iqr_overall = f_iqr
-        row.psf_grid_fwhm_cell_range = f_rng
-        row.psf_grid_fwhm_center_minus_corner = _safe_float(r["fwhm_center_minus_corner"])
-
-        # IQR should be non-negative if present
-        if f_iqr is not None and f_iqr < 0:
-            _append_anom(anoms, "psf_grid_fwhm_iqr_negative")
-
-        # min/max ordering
-        if f_min is not None and f_max is not None and f_min > f_max:
-            _append_anom(anoms, "psf_grid_fwhm_min_gt_max")
-
-        # median within min/max
-        if f_med is not None and f_min is not None and f_max is not None:
-            if not (f_min <= f_med <= f_max):
-                _append_anom(anoms, "psf_grid_fwhm_median_outside_minmax")
-
-        # range consistency: range ~= max-min (loose tolerance)
-        if f_rng is not None and f_min is not None and f_max is not None:
-            expected = f_max - f_min
-            if not _approx_equal(f_rng, expected, tol=1e-3):
-                _append_anom(anoms, "psf_grid_fwhm_range_mismatch")
-
-        # deltas should be finite if present
-        for col, msg in [
-            ("fwhm_center_minus_corner", "psf_grid_fwhm_center_minus_corner_nonfinite"),
-            ("fwhm_left_right_delta", "psf_grid_fwhm_left_right_delta_nonfinite"),
-            ("fwhm_top_bottom_delta", "psf_grid_fwhm_top_bottom_delta_nonfinite"),
-        ]:
-            v = _safe_float(r[col])
-            if v is not None and not _is_finite(v):
-                _append_anom(anoms, msg)
-
-        # ECC checks
-        e_med = _safe_float(r["ecc_cell_median_overall"])
-        e_max = _safe_float(r["ecc_cell_max"])
-        e_ctr = _safe_float(r["ecc_center"])
-        e_corn = _safe_float(r["ecc_corners_median"])
-        e_d = _safe_float(r["ecc_center_minus_corners"])
-
-        row.psf_grid_ecc_cell_median_overall = e_med
-        row.psf_grid_ecc_center_minus_corners = e_d
-
-        if not _clamp01(e_med):
-            _append_anom(anoms, "psf_grid_ecc_median_out_of_range")
-        if not _clamp01(e_max):
-            _append_anom(anoms, "psf_grid_ecc_max_out_of_range")
-        if not _clamp01(e_ctr):
-            _append_anom(anoms, "psf_grid_ecc_center_out_of_range")
-        if not _clamp01(e_corn):
-            _append_anom(anoms, "psf_grid_ecc_corners_out_of_range")
-
-        # ecc_center_minus_corners is a delta; just require finite if present
-        if e_d is not None and not _is_finite(e_d):
-            _append_anom(anoms, "psf_grid_ecc_center_minus_corners_nonfinite")
-
 
 def _check_psf2(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> None:
     if not _table_exists(conn, "psf_model_metrics"):
@@ -515,6 +445,10 @@ def _check_psf2(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> No
         _append_anom(anoms, "psf2_not_usable_but_reason_ok")
 
 
+# -----------------------------
+# Performance helpers
+# -----------------------------
+
 def _module_duration(conn: sqlite3.Connection, image_id: int, module_name: str) -> Optional[int]:
     if not _table_exists(conn, "module_runs"):
         return None
@@ -532,17 +466,114 @@ def _module_duration(conn: sqlite3.Connection, image_id: int, module_name: str) 
     if not r:
         return None
     try:
+        if r["duration_ms"] is None:
+            return None
         return int(r["duration_ms"])
     except Exception:
         return None
+
+
+def _export_perf_csv_from_views(conn: sqlite3.Connection, out_csv: Path, summary: Dict[str, Any]) -> None:
+    """
+    Export two sections into one CSV:
+      1) v_perf_module_rollup
+      2) v_perf_total_rollup
+    Also sanity-checks that the views exist + return rows.
+    """
+    views = ["v_perf_module_rollup", "v_perf_total_rollup"]
+    summary.setdefault("views_present", {})
+    for v in views:
+        summary["views_present"][v] = _view_exists(conn, v)
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", newline="") as f:
+        w = csv.writer(f)
+
+        # Section 1
+        w.writerow(["section", "v_perf_module_rollup"])
+        if not _view_exists(conn, "v_perf_module_rollup"):
+            w.writerow(["error", "view_missing"])
+        else:
+            rows = conn.execute("SELECT * FROM v_perf_module_rollup;").fetchall()
+            if not rows:
+                w.writerow(["warning", "no_rows"])
+            else:
+                cols = list(rows[0].keys())
+                w.writerow(cols)
+                for r in rows:
+                    w.writerow([r[c] for c in cols])
+
+        w.writerow([])
+
+        # Section 2
+        w.writerow(["section", "v_perf_total_rollup"])
+        if not _view_exists(conn, "v_perf_total_rollup"):
+            w.writerow(["error", "view_missing"])
+        else:
+            rows = conn.execute("SELECT * FROM v_perf_total_rollup;").fetchall()
+            if not rows:
+                w.writerow(["warning", "no_rows"])
+            else:
+                cols = list(rows[0].keys())
+                w.writerow(cols)
+                for r in rows:
+                    w.writerow([r[c] for c in cols])
+
+
+def _check_perf_views(conn: sqlite3.Connection, summary: Dict[str, Any]) -> None:
+    """
+    Add view-related anomalies into summary['anomaly_counts'] if anything looks wrong.
+    We keep this lightweight: existence + basic duration sanity.
+    """
+    def bump(msg: str) -> None:
+        summary["anomaly_counts"][msg] = summary["anomaly_counts"].get(msg, 0) + 1
+
+    if not _view_exists(conn, "v_perf_module_rollup"):
+        bump("view_missing:v_perf_module_rollup")
+        return
+
+    # Basic checks: non-negative durations where present
+    try:
+        rows = conn.execute("SELECT * FROM v_perf_module_rollup LIMIT 500;").fetchall()
+        for r in rows:
+            # "avg_ms" name depends on your view; tolerate variants.
+            for key in ("avg_ms", "avg_duration_ms", "avg_processing_ms"):
+                if key in r.keys():
+                    v = _safe_float(r[key])
+                    if v is not None and v < 0:
+                        bump("v_perf_module_rollup_negative_avg_ms")
+                    break
+    except Exception:
+        bump("v_perf_module_rollup_query_failed")
+
+    if not _view_exists(conn, "v_perf_total_rollup"):
+        bump("view_missing:v_perf_total_rollup")
+        return
+
+    try:
+        rows = conn.execute("SELECT * FROM v_perf_total_rollup LIMIT 500;").fetchall()
+        for r in rows:
+            for key in ("avg_total_ms", "avg_ms", "avg_duration_ms", "avg_processing_ms"):
+                if key in r.keys():
+                    v = _safe_float(r[key])
+                    if v is not None and v < 0:
+                        bump("v_perf_total_rollup_negative_avg_total_ms")
+                    break
+    except Exception:
+        bump("v_perf_total_rollup_query_failed")
 
 
 # -----------------------------
 # Main report generation
 # -----------------------------
 
-def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
+def run(db_path: Path, out_csv: Optional[Path], out_json: Optional[Path], out_perf_csv: Optional[Path]) -> int:
     conn = _connect(db_path)
+
+    stamp = _now_stamp()
+    out_csv = out_csv or (Path("data") / f"sanity_report_{stamp}.csv")
+    out_json = out_json or (Path("data") / f"sanity_summary_{stamp}.json")
+    out_perf_csv = out_perf_csv or (Path("data") / f"sanity_performance_{stamp}.csv")
 
     images = _fetch_images(conn)
     mod_ok = _module_run_ok_map(conn)
@@ -553,7 +584,13 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
         "status_counts": {},
         "imagetyp_counts": {},
         "tables_present": {},
+        "views_present": {},
         "anomaly_counts": {},
+        "outputs": {
+            "report_csv": str(out_csv),
+            "summary_json": str(out_json),
+            "performance_csv": str(out_perf_csv),
+        },
     }
 
     for t in [
@@ -568,8 +605,15 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
         "psf_model_metrics",
         "module_runs",
         "flat_metrics",
+        "flat_profiles",
+        "flat_capture_sets",
+        "flat_frame_links",
     ]:
         summary["tables_present"][t] = _table_exists(conn, t)
+
+    # View checks + view-export
+    _check_perf_views(conn, summary)
+    _export_perf_csv_from_views(conn, out_perf_csv, summary)
 
     rows_out: List[ImageRow] = []
 
@@ -600,6 +644,7 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
         row.fits_ok = mod_ok.get((image_id, "fits_header_worker"), 0)
 
         is_flat = (imagetyp == "FLAT")
+        is_light = (imagetyp == "LIGHT" or imagetyp == "")
 
         def set_flag(attr: str, applicable: bool, module_name: str) -> None:
             if not applicable:
@@ -607,6 +652,7 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
                 return
             setattr(row, attr, "1" if mod_ok.get((image_id, module_name), 0) == 1 else "0")
 
+        # flags
         set_flag("flat_group_ok", is_flat, "flat_group_worker")
         set_flag("flat_basic_ok", is_flat, "flat_basic_worker")
 
@@ -619,6 +665,7 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
         set_flag("psf_grid_ok", (not is_flat), "psf_grid_worker")
         set_flag("psf2_ok", (not is_flat), "psf_model_worker")
 
+        # checks
         _check_fits_header(row, anoms)
 
         if not is_flat:
@@ -628,14 +675,27 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
             _check_psf1(conn, row, anoms)
             _check_psf_grid(conn, row, anoms)
             _check_psf2(conn, row, anoms)
+        else:
+            # For flats, we mostly just want to know the flat tables got rows
+            if _table_exists(conn, "flat_metrics"):
+                fr = conn.execute("SELECT 1 FROM flat_metrics WHERE image_id=?", (image_id,)).fetchone()
+                if not fr and row.flat_basic_ok == "1":
+                    _append_anom(anoms, "flat_metrics_missing_row")
 
-            d2 = _module_duration(conn, image_id, "psf_model_worker")
-            row.psf2_duration_ms = d2
-            if d2 is not None and row.psf2_n_modeled and row.psf2_n_modeled > 0:
-                row.psf2_ms_per_star = float(d2) / float(row.psf2_n_modeled)
+        # per-image durations (from module_runs)
+        row.fits_duration_ms = _module_duration(conn, image_id, "fits_header_worker")
+        row.sky_basic_duration_ms = _module_duration(conn, image_id, "sky_basic_worker")
+        row.sky_bkg2d_duration_ms = _module_duration(conn, image_id, "sky_background2d_worker")
+        row.exposure_duration_ms = _module_duration(conn, image_id, "exposure_advice_worker")
+        row.flat_group_duration_ms = _module_duration(conn, image_id, "flat_group_worker")
+        row.flat_basic_duration_ms = _module_duration(conn, image_id, "flat_basic_worker")
+        row.psf0_duration_ms = _module_duration(conn, image_id, "psf_detect_worker")
+        row.psf1_duration_ms = _module_duration(conn, image_id, "psf_basic_worker")
+        row.psf_grid_duration_ms = _module_duration(conn, image_id, "psf_grid_worker")
+        row.psf2_duration_ms = _module_duration(conn, image_id, "psf_model_worker")
 
-            dg = _module_duration(conn, image_id, "psf_grid_worker")
-            row.psf_grid_duration_ms = dg
+        if row.psf2_duration_ms is not None and row.psf2_n_modeled and row.psf2_n_modeled > 0:
+            row.psf2_ms_per_star = float(row.psf2_duration_ms) / float(row.psf2_n_modeled)
 
         row.anomalies = ";".join(anoms)
         for a in anoms:
@@ -665,19 +725,21 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
             "psf_grid_corner_fwhm_px_median",
             "psf_grid_center_to_corner_ratio",
 
-            # NEW grid rollups (latest)
-            "psf_grid_fwhm_cell_median_overall",
-            "psf_grid_fwhm_cell_iqr_overall",
-            "psf_grid_fwhm_cell_range",
-            "psf_grid_fwhm_center_minus_corner",
-            "psf_grid_ecc_cell_median_overall",
-            "psf_grid_ecc_center_minus_corners",
-
             "psf2_n_modeled",
             "psf2_gauss_fwhm_med", "psf2_gauss_fwhm_p90", "psf2_gauss_ecc_med",
 
+            # durations
+            "fits_duration_ms",
+            "sky_basic_duration_ms",
+            "sky_bkg2d_duration_ms",
+            "exposure_duration_ms",
+            "flat_group_duration_ms",
+            "flat_basic_duration_ms",
+            "psf0_duration_ms",
+            "psf1_duration_ms",
             "psf_grid_duration_ms",
-            "psf2_duration_ms", "psf2_ms_per_star",
+            "psf2_duration_ms",
+            "psf2_ms_per_star",
 
             "anomalies",
         ])
@@ -700,18 +762,20 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
                 r.psf_grid_corner_fwhm_px_median,
                 r.psf_grid_center_to_corner_ratio,
 
-                r.psf_grid_fwhm_cell_median_overall,
-                r.psf_grid_fwhm_cell_iqr_overall,
-                r.psf_grid_fwhm_cell_range,
-                r.psf_grid_fwhm_center_minus_corner,
-                r.psf_grid_ecc_cell_median_overall,
-                r.psf_grid_ecc_center_minus_corners,
-
                 r.psf2_n_modeled,
                 r.psf2_gauss_fwhm_med, r.psf2_gauss_fwhm_p90, r.psf2_gauss_ecc_med,
 
+                r.fits_duration_ms,
+                r.sky_basic_duration_ms,
+                r.sky_bkg2d_duration_ms,
+                r.exposure_duration_ms,
+                r.flat_group_duration_ms,
+                r.flat_basic_duration_ms,
+                r.psf0_duration_ms,
+                r.psf1_duration_ms,
                 r.psf_grid_duration_ms,
-                r.psf2_duration_ms, r.psf2_ms_per_star,
+                r.psf2_duration_ms,
+                r.psf2_ms_per_star,
 
                 r.anomalies,
             ])
@@ -723,6 +787,9 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
 
     n_anom_total = sum(int(v) for v in summary["anomaly_counts"].values())
     print(f"[sanity_check] images={summary['n_images']} total_anomalies={n_anom_total}")
+    print(f"[sanity_check] report={out_csv}")
+    print(f"[sanity_check] summary={out_json}")
+    print(f"[sanity_check] performance={out_perf_csv}")
     if summary["anomaly_counts"]:
         top = sorted(summary["anomaly_counts"].items(), key=lambda kv: kv[1], reverse=True)[:10]
         for k, v in top:
@@ -733,13 +800,21 @@ def run(db_path: Path, out_csv: Path, out_json: Path) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Centaur sanity checker (DB -> CSV + JSON).")
+    ap = argparse.ArgumentParser(description="Centaur sanity checker (DB -> CSV + JSON + performance CSV).")
     ap.add_argument("--db", type=str, default="data/centaurparting.db", help="Path to SQLite DB")
-    ap.add_argument("--out", type=str, default="data/sanity_report.csv", help="Output CSV path")
-    ap.add_argument("--summary", type=str, default="data/sanity_summary.json", help="Output JSON summary path")
+
+    # Optional: if omitted, we auto-name with timestamp.
+    ap.add_argument("--out", type=str, default="", help="Output CSV path (blank = auto timestamp)")
+    ap.add_argument("--summary", type=str, default="", help="Output JSON summary path (blank = auto timestamp)")
+    ap.add_argument("--perf", type=str, default="", help="Output performance CSV path (blank = auto timestamp)")
+
     args = ap.parse_args()
 
-    return run(Path(args.db), Path(args.out), Path(args.summary))
+    out_csv = Path(args.out) if args.out.strip() else None
+    out_json = Path(args.summary) if args.summary.strip() else None
+    out_perf = Path(args.perf) if args.perf.strip() else None
+
+    return run(Path(args.db), out_csv, out_json, out_perf)
 
 
 if __name__ == "__main__":

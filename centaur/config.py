@@ -103,10 +103,10 @@ def default_config() -> AppConfig:
                 "sky_basic_worker": False,# Example: "fits_header_worker": True
                 "exposure_advice_worker": False,
                 "sky_background2d_worker": False,
-                "psf_detect_worker": True,
+                "psf_detect_worker": False,
                 "psf_basic_worker": False,
-                "psf_model_worker": True,
-                "psf_grid_worker" : True,
+                "psf_model_worker": False,
+                "psf_grid_worker" : False,
 
 
 

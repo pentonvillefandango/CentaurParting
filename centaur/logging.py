@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import threading
 
+def log_ts() -> str:
+    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 def utc_now() -> str:
     """
@@ -42,11 +44,12 @@ class Logger:
         self._config = config
         self._lock = threading.Lock()
 
+
     def _print_header(self, module: str, file: Optional[str]) -> None:
-        print(module)
+        ts = log_ts()
+        print(f"[{ts}] {module}")
         if file:
             print(f"  file: {file}")
-
     def log_module_summary(
         self,
         module: str,

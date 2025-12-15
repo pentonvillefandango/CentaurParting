@@ -219,6 +219,7 @@ CREATE TABLE IF NOT EXISTS module_runs (
     started_utc TEXT NOT NULL,
     ended_utc TEXT NOT NULL,
     duration_ms INTEGER,
+    duration_us INTEGER,
     db_written_utc TEXT NOT NULL,
 
     FOREIGN KEY (image_id)
@@ -234,5 +235,52 @@ CREATE INDEX IF NOT EXISTS idx_module_runs_module
 
 CREATE INDEX IF NOT EXISTS idx_module_runs_status
     ON module_runs (status);
-"""
 
+--------------------------------------------------
+-- Performance Views (GUI + sanity_check contract)
+--------------------------------------------------
+
+-- Per-module rollups by imagetyp/camera/filter
+CREATE VIEW IF NOT EXISTS v_perf_module_rollup AS
+SELECT
+  COALESCE(UPPER(TRIM(h.imagetyp)), '') AS imagetyp,
+  COALESCE(LOWER(TRIM(h.instrume)), '') AS camera,
+  COALESCE(LOWER(TRIM(h.filter)), '') AS filter,
+  mr.module_name AS module_name,
+
+  COUNT(*) AS n_runs,
+  AVG(CAST(mr.duration_ms AS REAL)) AS avg_duration_ms,
+  MIN(mr.duration_ms) AS min_duration_ms,
+  MAX(mr.duration_ms) AS max_duration_ms
+
+FROM module_runs mr
+JOIN fits_header_core h ON h.image_id = mr.image_id
+WHERE mr.status = 'ok'
+  AND mr.duration_ms IS NOT NULL
+GROUP BY imagetyp, camera, filter, module_name;
+
+-- Total (sum of module times) rollups by imagetyp/camera/filter
+CREATE VIEW IF NOT EXISTS v_perf_total_rollup AS
+WITH per_image AS (
+  SELECT
+    image_id,
+    SUM(duration_ms) AS total_ms
+  FROM module_runs
+  WHERE status = 'ok'
+    AND duration_ms IS NOT NULL
+  GROUP BY image_id
+)
+SELECT
+  COALESCE(UPPER(TRIM(h.imagetyp)), '') AS imagetyp,
+  COALESCE(LOWER(TRIM(h.instrume)), '') AS camera,
+  COALESCE(LOWER(TRIM(h.filter)), '') AS filter,
+
+  COUNT(*) AS n_images,
+  AVG(CAST(per_image.total_ms AS REAL)) AS avg_total_duration_ms,
+  MIN(per_image.total_ms) AS min_total_duration_ms,
+  MAX(per_image.total_ms) AS max_total_duration_ms
+
+FROM per_image
+JOIN fits_header_core h ON h.image_id = per_image.image_id
+GROUP BY imagetyp, camera, filter;
+"""

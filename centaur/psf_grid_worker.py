@@ -67,14 +67,15 @@ def _insert_module_run(
     started_utc: str,
     ended_utc: str,
     duration_ms: int,
+    duration_us: int,
 ) -> None:
     db.execute(
         """
         INSERT INTO module_runs
         (image_id, module_name, expected_fields, read_fields, written_fields,
-         status, message, started_utc, ended_utc, duration_ms, db_written_utc)
+         status, message, started_utc, ended_utc, duration_ms, duration_us, db_written_utc)
         VALUES (?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?)
+                ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             image_id,
@@ -87,12 +88,12 @@ def _insert_module_run(
             started_utc,
             ended_utc,
             duration_ms,
+            duration_us,
             utc_now(),
         ),
     )
 
 
-# Duck-typed ctx for safety: pipeline passes an object with .psf1 dict
 @dataclass
 class _DummyCtx:
     psf1: Optional[Dict[str, Any]] = None
@@ -115,7 +116,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             if image_id is None:
                 raise RuntimeError("image_id_not_found")
 
-        # Gate: need PSF-1 in-memory payload
         if not isinstance(psf1, dict):
             fields = {"usable": 0, "reason": "psf1_context_missing"}
             row = _build_empty_row(
@@ -140,7 +140,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
         if not (len(star_xy) == len(fwhm_px) == len(ecc)):
             raise RuntimeError("psf1_length_mismatch")
 
-        # Filter accepted stars
         acc_xy: List[Tuple[int, int]] = []
         acc_f: List[float] = []
         acc_e: List[float] = []
@@ -172,7 +171,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             _write_row_and_log(cfg, logger, event, image_id, row, fields, started_utc, t0)
             return None
 
-        # Bin into 3x3
         cell_w = w / float(grid_cols)
         cell_h = h / float(grid_rows)
 
@@ -187,7 +185,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             cell_f[r][c].append(float(f))
             cell_e[r][c].append(float(e))
 
-        # Cell medians (min-stars rule)
         cell_n = [[len(cell_f[r][c]) for c in range(grid_cols)] for r in range(grid_rows)]
         cell_f_med: List[List[Optional[float]]] = [[None for _ in range(grid_cols)] for _ in range(grid_rows)]
         cell_e_med: List[List[Optional[float]]] = [[None for _ in range(grid_cols)] for _ in range(grid_rows)]
@@ -201,7 +198,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
                     if cell_f_med[r][c] is not None:
                         n_cells_with_data += 1
 
-        # Existing rollups
         center = cell_f_med[1][1]
         corners = [cell_f_med[0][0], cell_f_med[0][2], cell_f_med[2][0], cell_f_med[2][2]]
         corners_ok = [v for v in corners if v is not None]
@@ -220,7 +216,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
         left_right = (left_med / right_med) if (left_med is not None and right_med is not None and right_med > 0) else None
         top_bottom = (top_med / bot_med) if (top_med is not None and bot_med is not None and bot_med > 0) else None
 
-        # NEW: FWHM rollups across cells (using available cell medians only)
         fwhm_cells: List[float] = []
         for r in range(grid_rows):
             for c in range(grid_cols):
@@ -239,7 +234,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
         fwhm_left_right_delta = (right_med - left_med) if (right_med is not None and left_med is not None) else None
         fwhm_top_bottom_delta = (bot_med - top_med) if (bot_med is not None and top_med is not None) else None
 
-        # NEW: ECC rollups across cells
         ecc_cells: List[float] = []
         for r in range(grid_rows):
             for c in range(grid_cols):
@@ -257,7 +251,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
         ecc_corners_median = _median([float(v) for v in ecc_corners_ok]) if len(ecc_corners_ok) >= 2 else None
         ecc_center_minus_corners = (ecc_center - ecc_corners_median) if (ecc_center is not None and ecc_corners_median is not None) else None
 
-        # Usable decision (unchanged)
         if n_cells_with_data < 3:
             usable = 0
             reason = "too_few_cells_with_data"
@@ -265,7 +258,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             usable = 1
             reason = "ok"
 
-        # Build row dict matching schema
         row = {
             "image_id": image_id,
 
@@ -282,14 +274,12 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             "n_input_stars": n_input_stars,
             "n_cells_with_data": int(n_cells_with_data),
 
-            # existing rollups
             "center_fwhm_px": center,
             "corner_fwhm_px_median": corner_med,
             "center_to_corner_fwhm_ratio": center_to_corner,
             "left_right_fwhm_ratio": left_right,
             "top_bottom_fwhm_ratio": top_bottom,
 
-            # new rollups
             "fwhm_cell_median_overall": fwhm_cell_median_overall,
             "fwhm_cell_iqr_overall": fwhm_cell_iqr_overall,
             "fwhm_cell_min": fwhm_cell_min,
@@ -305,7 +295,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             "ecc_corners_median": ecc_corners_median,
             "ecc_center_minus_corners": ecc_center_minus_corners,
 
-            # cells
             "cell_r0c0_n": int(cell_n[0][0]), "cell_r0c0_fwhm_px_median": cell_f_med[0][0], "cell_r0c0_ecc_median": cell_e_med[0][0],
             "cell_r0c1_n": int(cell_n[0][1]), "cell_r0c1_fwhm_px_median": cell_f_med[0][1], "cell_r0c1_ecc_median": cell_e_med[0][1],
             "cell_r0c2_n": int(cell_n[0][2]), "cell_r0c2_fwhm_px_median": cell_f_med[0][2], "cell_r0c2_ecc_median": cell_e_med[0][2],
@@ -322,7 +311,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             "reason": str(reason),
         }
 
-        expected_fields = len(row) - 1  # excluding image_id
+        expected_fields = len(row) - 1
         row["expected_fields"] = expected_fields
         row["read_fields"] = expected_fields
 
@@ -454,6 +443,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
                 ),
             )
 
+            duration_us = int((time.monotonic() - t0) * 1_000_000)
+            duration_ms = int(duration_us // 1000)
+
             _insert_module_run(
                 db,
                 image_id,
@@ -464,7 +456,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
                 message=None,
                 started_utc=started_utc,
                 ended_utc=utc_now(),
-                duration_ms=int((time.monotonic() - t0) * 1000),
+                duration_ms=duration_ms,
+                duration_us=duration_us,
             )
 
         logger.log_module_result(
@@ -648,6 +641,9 @@ def _write_row_and_log(
             ),
         )
 
+        duration_us = int((time.monotonic() - t0) * 1_000_000)
+        duration_ms = int(duration_us // 1000)
+
         _insert_module_run(
             db,
             image_id,
@@ -658,7 +654,8 @@ def _write_row_and_log(
             message="skipped_psf_grid",
             started_utc=started_utc,
             ended_utc=utc_now(),
-            duration_ms=int((time.monotonic() - t0) * 1000),
+            duration_ms=duration_ms,
+            duration_us=duration_us,
         )
 
     logger.log_module_result(

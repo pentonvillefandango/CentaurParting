@@ -226,7 +226,6 @@ def _measure_star(cut: np.ndarray) -> Optional[Tuple[float, float, float, float]
         return None
 
     # Eigenvalues of covariance-like matrix give axis sigmas
-    # [mxx mxy; mxy myy]
     tr = mxx + myy
     det = mxx * myy - mxy * mxy
     if det <= 0:
@@ -244,17 +243,12 @@ def _measure_star(cut: np.ndarray) -> Optional[Tuple[float, float, float, float]
     sigma_major = float(np.sqrt(max(lam1, lam2)))
     sigma_minor = float(np.sqrt(min(lam1, lam2)))
 
-    # Eccentricity-like (0 = round, approaching 1 = elongated)
     ecc = 1.0 - (sigma_minor / sigma_major)
-
-    # Orientation angle of major axis
     theta = 0.5 * float(np.arctan2(2.0 * mxy, (mxx - myy)))
 
-    # FWHM proxy in px (Gaussian-ish)
     sigma_eff = float(np.sqrt(0.5 * (sigma_major * sigma_major + sigma_minor * sigma_minor)))
     fwhm = 2.355 * sigma_eff
 
-    # HFR: half-flux radius
     r = np.sqrt(dx * dx + dy * dy)
     order = np.argsort(r.flat)
     cumsum = np.cumsum(data.flat[order])
@@ -310,14 +304,15 @@ def _insert_module_run(
     started_utc: str,
     ended_utc: str,
     duration_ms: int,
+    duration_us: int,
 ) -> None:
     db.execute(
         """
         INSERT INTO module_runs
         (image_id, module_name, expected_fields, read_fields, written_fields,
-         status, message, started_utc, ended_utc, duration_ms, db_written_utc)
+         status, message, started_utc, ended_utc, duration_ms, duration_us, db_written_utc)
         VALUES (?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?)
+                ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             image_id,
@@ -330,6 +325,7 @@ def _insert_module_run(
             started_utc,
             ended_utc,
             duration_ms,
+            duration_us,
             utc_now(),
         ),
     )
@@ -339,7 +335,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
     t0 = time.monotonic()
     started_utc = utc_now()
 
-    # Detection / selection config (matches PSF-0 semantics)
     use_roi = getattr(cfg, "psf_use_roi", True)
     roi_fraction = float(getattr(cfg, "psf_roi_fraction", 0.5)) if use_roi else 1.0
     threshold_sigma = float(getattr(cfg, "psf_threshold_sigma", 8.0))
@@ -347,7 +342,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
     min_separation_px = int(getattr(cfg, "psf_min_separation_px", 8))
     edge_margin_px = int(getattr(cfg, "psf_edge_margin_px", 16))
 
-    # PSF-1 specifics
     cutout_radius_px = int(getattr(cfg, "psf_cutout_radius_px", 8))
     max_stars_measured = int(getattr(cfg, "psf1_max_stars_measured", 5000))  # 0 = unlimited
     max_peaks_considered = int(getattr(cfg, "psf_max_stars", 0))  # reuse PSF-0 cap if set (0=unlimited)
@@ -360,7 +354,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
         if img2d.size == 0:
             raise ValueError("unsupported_fits_data_shape")
 
-        # ROI or full frame
         if use_roi and roi_fraction < 1.0:
             roi2d, (x0, y0) = _central_roi(img2d, roi_fraction=roi_fraction)
         else:
@@ -380,11 +373,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             threshold_adu = float(bg_median + threshold_sigma * bg_madstd)
             good_threshold_adu = float(bg_median + (threshold_sigma + good_extra_sigma) * bg_madstd)
 
-        # Detect peaks (bounded by psf_max_stars if you already cap that)
         peaks = _build_peaks(roi2d, threshold_adu=threshold_adu, max_peaks=max_peaks_considered)
         n_peaks_total = int(len(peaks))
 
-        # Select good peaks (grid + edges + brightness)
         h, w = roi2d.shape[:2]
         good_peaks, _edge_rej = _select_good_peaks(
             peaks,
@@ -396,7 +387,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
         )
         n_peaks_good = int(len(good_peaks))
 
-        # Measure per-star (in memory only)
         hfr_vals: List[float] = []
         fwhm_vals: List[float] = []
         ecc_vals: List[float] = []
@@ -407,10 +397,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
         n_rej_cutout = 0
         n_rej_measure = 0
 
-        # NEW: track exactly which stars we successfully measured (full-frame coords)
         measured_xy: List[Tuple[int, int]] = []
 
-        # If max_stars_measured is set, take the brightest good peaks (good_peaks is already bright-sorted)
         to_measure = good_peaks
         if max_stars_measured > 0 and len(to_measure) > max_stars_measured:
             to_measure = to_measure[:max_stars_measured]
@@ -450,7 +438,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
 
         n_measured = int(len(hfr_vals))
 
-        # NEW: publish PSF-1 runtime context for downstream workers (best-effort only)
         if ctx is not None:
             try:
                 ctx.psf1 = {
@@ -462,18 +449,14 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             except Exception:
                 pass
 
-        # NEW: JSON list of the *measured* stars only (PSF-2 should consume this)
-        # Keep it simple: list of {x,y}
         star_xy_json = json.dumps([{"x": x, "y": y} for (x, y) in measured_xy]) if measured_xy else "[]"
 
-        # Angular summary: keep it simple and robust
         theta_med = _pct(theta_vals, 50)
         theta_p90abs = None
         if theta_med is not None and theta_vals:
             diffs = [abs(float(t) - float(theta_med)) for t in theta_vals]
             theta_p90abs = _pct(diffs, 90)
 
-        # Usability decision
         if n_measured < 25:
             usable = 0
             reason = "too_few_psf_stars_measured"
@@ -580,7 +563,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             )
 
             ended_utc = utc_now()
-            duration_ms = int((time.monotonic() - t0) * 1000)
+            duration_us = int((time.monotonic() - t0) * 1_000_000)
+            duration_ms = int(duration_us // 1000)
+
             _insert_module_run(
                 db,
                 image_id,
@@ -592,6 +577,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
                 started_utc=started_utc,
                 ended_utc=ended_utc,
                 duration_ms=duration_ms,
+                duration_us=duration_us,
             )
 
             _maybe_dump_psf1_csv(cfg, image_id, event.file_path, per_star_rows)

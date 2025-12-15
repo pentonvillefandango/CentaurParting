@@ -288,14 +288,15 @@ def _insert_module_run(
     started_utc: str,
     ended_utc: str,
     duration_ms: int,
+    duration_us: int,
 ) -> None:
     db.execute(
         """
         INSERT INTO module_runs
         (image_id, module_name, expected_fields, read_fields, written_fields,
-         status, message, started_utc, ended_utc, duration_ms, db_written_utc)
+         status, message, started_utc, ended_utc, duration_ms, duration_us, db_written_utc)
         VALUES (?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?)
+                ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             image_id,
@@ -308,6 +309,7 @@ def _insert_module_run(
             started_utc,
             ended_utc,
             duration_ms,
+            duration_us,
             utc_now(),
         ),
     )
@@ -499,7 +501,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             )
 
             ended_utc = utc_now()
-            duration_ms = int((time.monotonic() - t0) * 1000)
+            duration_us = int((time.monotonic() - t0) * 1_000_000)
+            duration_ms = int(duration_us // 1000)
+
             _insert_module_run(
                 db,
                 image_id,
@@ -511,6 +515,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 started_utc=started_utc,
                 ended_utc=ended_utc,
                 duration_ms=duration_ms,
+                duration_us=duration_us,
             )
 
             _maybe_dump_candidates_csv(cfg, image_id, event.file_path, candidates)
