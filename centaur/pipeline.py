@@ -61,6 +61,8 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
     from centaur.fits_header_worker import process_file_event as fits_header_process
     from centaur.sky_basic_worker import process_file_event as sky_basic_process
     from centaur.sky_background2d_worker import process_file_event as sky_bkg2d_process
+    from centaur.saturation_worker import process_file_event as saturation_process
+    from centaur.roi_signal_worker import process_file_event as roi_signal_process
     from centaur.exposure_advice_worker import process_file_event as exposure_advice_process
     from centaur.flat_basic_worker import process_file_event as flat_basic_process
     from centaur.flat_group_worker import process_file_event as flat_group_process
@@ -68,6 +70,7 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
     from centaur.psf_basic_worker import process_file_event as psf_basic_process
     from centaur.psf_grid_worker import process_file_event as psf_grid_process
     from centaur.psf_model_worker import process_file_event as psf_model_process
+    from centaur.signal_structure_worker import process_file_event as signal_structure_process
 
     return {
         # Must run first so image_id exists and header tables are populated.
@@ -80,6 +83,14 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
         # Sky metrics (LIGHT frames)
         "sky_basic_worker": sky_basic_process,
         "sky_background2d_worker": sky_bkg2d_process,
+        
+        # New : signal structure
+        "signal_structure_worker": signal_structure_process,
+
+        # New: saturation + target ROI signal (LIGHT frames)
+        "saturation_worker": saturation_process,
+        "roi_signal_worker": roi_signal_process,
+
 
         # Decision layer (Module0) (LIGHT frames)
         "exposure_advice_worker": exposure_advice_process,
@@ -265,6 +276,9 @@ def run_pipeline_for_event(
         for name in (
             "sky_basic_worker",
             "sky_background2d_worker",
+            "signal_structure_worker",
+            "saturation_worker",
+            "roi_signal_worker",
             "exposure_advice_worker",
             "psf_detect_worker",
             "psf_basic_worker",
@@ -282,6 +296,9 @@ def run_pipeline_for_event(
     for name in (
         "sky_basic_worker",
         "sky_background2d_worker",
+        "saturation_worker",
+        "signal_structure_worker",
+        "roi_signal_worker",
         "exposure_advice_worker",
         "psf_detect_worker",
         "psf_basic_worker",

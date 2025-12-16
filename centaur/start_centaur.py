@@ -23,7 +23,10 @@ from centaur.schema_psf_detect import ensure_psf_detect_schema
 from centaur.schema_psf_basic import ensure_psf_basic_schema
 from centaur.schema_psf_model import ensure_psf_model_schema
 from centaur.schema_psf_grid import ensure_psf_grid_schema
+from centaur.schema_saturation import ensure_saturation_schema
+from centaur.schema_roi_signal import ensure_roi_signal_schema
 from centaur.ensure_migrations import ensure_migrations
+from centaur.schema_signal_structure import ensure_signal_structure_schema
 
 
 def main() -> None:
@@ -47,6 +50,12 @@ def main() -> None:
     ensure_psf_basic_schema(cfg.db_path)
     ensure_psf_model_schema(cfg.db_path)
     ensure_psf_grid_schema(cfg.db_path)
+
+    # NEW
+    ensure_saturation_schema(cfg.db_path)
+    ensure_roi_signal_schema(cfg.db_path)
+    ensure_signal_structure_schema(cfg.db_path)
+
     ensure_migrations(cfg.db_path)
 
     watcher = Watcher(cfg, logger)
