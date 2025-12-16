@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import threading
 
+
 def log_ts() -> str:
     return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
 
 def utc_now() -> str:
     """
@@ -14,6 +16,31 @@ def utc_now() -> str:
     (Used for DB timestamps, not printed in logs.)
     """
     return datetime.now(tz=timezone.utc).isoformat()
+
+
+def format_duration_s_style1(duration_s: Optional[float]) -> Optional[str]:
+    """
+    Style 1:
+      - < 1s  ->  "###ms"
+      - >= 1s ->  "#.##s" (under 10s), "#.#s" (10s+)
+    We intentionally accept seconds here so we can be a drop-in replacement
+    without changing any workers yet.
+    """
+    if duration_s is None:
+        return None
+
+    # Defensive: avoid weird negatives
+    if duration_s < 0:
+        return f"{duration_s:.2f}s"
+
+    if duration_s < 1.0:
+        ms = int(round(duration_s * 1000.0))
+        return f"{ms}ms"
+
+    if duration_s < 10.0:
+        return f"{duration_s:.2f}s"
+
+    return f"{duration_s:.1f}s"
 
 
 @dataclass
@@ -44,12 +71,12 @@ class Logger:
         self._config = config
         self._lock = threading.Lock()
 
-
     def _print_header(self, module: str, file: Optional[str]) -> None:
         ts = log_ts()
         print(f"[{ts}] {module}")
         if file:
             print(f"  file: {file}")
+
     def log_module_summary(
         self,
         module: str,
@@ -79,8 +106,10 @@ class Logger:
                 f"{written}/{expected_written} written | "
                 f"{status}"
             )
-            if duration_s is not None:
-                line += f" | {duration_s:.2f}s"
+
+            dur_txt = format_duration_s_style1(duration_s)
+            if dur_txt is not None:
+                line += f" | {dur_txt}"
 
             print(line)
             print()  # blank line between blocks for readability
@@ -104,8 +133,10 @@ class Logger:
             self._print_header(module, file)
 
             line = f"  FAILED | action={action} | reason={reason}"
-            if duration_s is not None:
-                line += f" | {duration_s:.2f}s"
+
+            dur_txt = format_duration_s_style1(duration_s)
+            if dur_txt is not None:
+                line += f" | {dur_txt}"
 
             print(line)
             print()  # blank line between blocks
@@ -160,8 +191,10 @@ class Logger:
                 f"{written}/{expected_written} written | "
                 f"{status}"
             )
-            if duration_s is not None:
-                line += f" | {duration_s:.2f}s"
+
+            dur_txt = format_duration_s_style1(duration_s)
+            if dur_txt is not None:
+                line += f" | {dur_txt}"
             print(line)
 
             if verbose_fields is not None and self._config.is_verbose(module):
