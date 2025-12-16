@@ -13,6 +13,9 @@ from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
 
+# NEW: pipeline writes module_runs centrally (with duration_us)
+from centaur.pipeline import ModuleRunRecord
+
 MODULE_NAME = "psf_grid_worker"
 
 
@@ -55,57 +58,21 @@ def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
     return int(row["image_id"]) if row else None
 
 
-def _insert_module_run(
-    db: Database,
-    image_id: int,
-    *,
-    expected_read: int,
-    read: int,
-    written: int,
-    status: str,
-    message: Optional[str],
-    started_utc: str,
-    ended_utc: str,
-    duration_ms: int,
-    duration_us: int,
-) -> None:
-    db.execute(
-        """
-        INSERT INTO module_runs
-        (image_id, module_name, expected_fields, read_fields, written_fields,
-         status, message, started_utc, ended_utc, duration_ms, duration_us, db_written_utc)
-        VALUES (?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            image_id,
-            MODULE_NAME,
-            expected_read,
-            read,
-            written,
-            status,
-            message,
-            started_utc,
-            ended_utc,
-            duration_ms,
-            duration_us,
-            utc_now(),
-        ),
-    )
-
-
 @dataclass
 class _DummyCtx:
     psf1: Optional[Dict[str, Any]] = None
 
 
-def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ctx: Optional[Any] = None) -> Optional[bool]:
+def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ctx: Optional[Any] = None) -> Any:
     t0 = time.monotonic()
-    started_utc = utc_now()
 
     grid_rows = 3
     grid_cols = 3
     min_stars_per_cell = int(getattr(cfg, "psf_grid_min_stars_per_cell", 10))
+
+    expected_fields = 0
+    written_fields = 0
+    image_id: Optional[int] = None
 
     try:
         ctx = ctx if ctx is not None else _DummyCtx()
@@ -116,17 +83,32 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             if image_id is None:
                 raise RuntimeError("image_id_not_found")
 
+        # If PSF-1 context missing, still write an “empty” metrics row and return OK
         if not isinstance(psf1, dict):
-            fields = {"usable": 0, "reason": "psf1_context_missing"}
             row = _build_empty_row(
+                image_id=image_id,
                 grid_rows=grid_rows,
                 grid_cols=grid_cols,
                 min_stars_per_cell=min_stars_per_cell,
                 n_input_stars=0,
                 reason="psf1_context_missing",
             )
-            _write_row_and_log(cfg, logger, event, image_id, row, fields, started_utc, t0)
-            return None
+            fields = {"usable": 0, "reason": "psf1_context_missing"}
+            _write_metrics_row(db_path=None, row=row)  # uses its own transaction
+            _log(logger, cfg, event, row, fields, t0)
+
+            expected_fields = int(row["expected_fields"])
+            written_fields = int(row["written_fields"])
+
+            return ModuleRunRecord(
+                image_id=int(image_id),
+                expected_read=expected_fields,
+                read=expected_fields,
+                expected_written=expected_fields,
+                written=written_fields,
+                status="OK",
+                message="psf1_context_missing",
+            )
 
         star_xy: List[Tuple[int, int]] = list(psf1.get("star_xy", []))
         fwhm_px: List[float] = list(psf1.get("fwhm_px", []))
@@ -161,6 +143,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
 
         if n_input_stars < 25:
             row = _build_empty_row(
+                image_id=image_id,
                 grid_rows=grid_rows,
                 grid_cols=grid_cols,
                 min_stars_per_cell=min_stars_per_cell,
@@ -168,8 +151,21 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
                 reason="too_few_input_stars",
             )
             fields = {"n_input_stars": n_input_stars, "usable": 0, "reason": "too_few_input_stars"}
-            _write_row_and_log(cfg, logger, event, image_id, row, fields, started_utc, t0)
-            return None
+            _write_metrics_row(db_path=None, row=row)
+            _log(logger, cfg, event, row, fields, t0)
+
+            expected_fields = int(row["expected_fields"])
+            written_fields = int(row["written_fields"])
+
+            return ModuleRunRecord(
+                image_id=int(image_id),
+                expected_read=expected_fields,
+                read=expected_fields,
+                expected_written=expected_fields,
+                written=written_fields,
+                status="OK",
+                message="too_few_input_stars",
+            )
 
         cell_w = w / float(grid_cols)
         cell_h = h / float(grid_rows)
@@ -258,71 +254,37 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             usable = 1
             reason = "ok"
 
-        row = {
-            "image_id": image_id,
-
-            "expected_fields": 0,
-            "read_fields": 0,
-            "written_fields": 0,
-            "parse_warnings": None,
-            "db_written_utc": utc_now(),
-
-            "grid_rows": grid_rows,
-            "grid_cols": grid_cols,
-            "grid_min_stars_per_cell": min_stars_per_cell,
-
-            "n_input_stars": n_input_stars,
-            "n_cells_with_data": int(n_cells_with_data),
-
-            "center_fwhm_px": center,
-            "corner_fwhm_px_median": corner_med,
-            "center_to_corner_fwhm_ratio": center_to_corner,
-            "left_right_fwhm_ratio": left_right,
-            "top_bottom_fwhm_ratio": top_bottom,
-
-            "fwhm_cell_median_overall": fwhm_cell_median_overall,
-            "fwhm_cell_iqr_overall": fwhm_cell_iqr_overall,
-            "fwhm_cell_min": fwhm_cell_min,
-            "fwhm_cell_max": fwhm_cell_max,
-            "fwhm_cell_range": fwhm_cell_range,
-            "fwhm_center_minus_corner": fwhm_center_minus_corner,
-            "fwhm_left_right_delta": fwhm_left_right_delta,
-            "fwhm_top_bottom_delta": fwhm_top_bottom_delta,
-
-            "ecc_cell_median_overall": ecc_cell_median_overall,
-            "ecc_cell_max": ecc_cell_max,
-            "ecc_center": ecc_center,
-            "ecc_corners_median": ecc_corners_median,
-            "ecc_center_minus_corners": ecc_center_minus_corners,
-
-            "cell_r0c0_n": int(cell_n[0][0]), "cell_r0c0_fwhm_px_median": cell_f_med[0][0], "cell_r0c0_ecc_median": cell_e_med[0][0],
-            "cell_r0c1_n": int(cell_n[0][1]), "cell_r0c1_fwhm_px_median": cell_f_med[0][1], "cell_r0c1_ecc_median": cell_e_med[0][1],
-            "cell_r0c2_n": int(cell_n[0][2]), "cell_r0c2_fwhm_px_median": cell_f_med[0][2], "cell_r0c2_ecc_median": cell_e_med[0][2],
-
-            "cell_r1c0_n": int(cell_n[1][0]), "cell_r1c0_fwhm_px_median": cell_f_med[1][0], "cell_r1c0_ecc_median": cell_e_med[1][0],
-            "cell_r1c1_n": int(cell_n[1][1]), "cell_r1c1_fwhm_px_median": cell_f_med[1][1], "cell_r1c1_ecc_median": cell_e_med[1][1],
-            "cell_r1c2_n": int(cell_n[1][2]), "cell_r1c2_fwhm_px_median": cell_f_med[1][2], "cell_r1c2_ecc_median": cell_e_med[1][2],
-
-            "cell_r2c0_n": int(cell_n[2][0]), "cell_r2c0_fwhm_px_median": cell_f_med[2][0], "cell_r2c0_ecc_median": cell_e_med[2][0],
-            "cell_r2c1_n": int(cell_n[2][1]), "cell_r2c1_fwhm_px_median": cell_f_med[2][1], "cell_r2c1_ecc_median": cell_e_med[2][1],
-            "cell_r2c2_n": int(cell_n[2][2]), "cell_r2c2_fwhm_px_median": cell_f_med[2][2], "cell_r2c2_ecc_median": cell_e_med[2][2],
-
-            "usable": int(usable),
-            "reason": str(reason),
-        }
-
-        expected_fields = len(row) - 1
-        row["expected_fields"] = expected_fields
-        row["read_fields"] = expected_fields
-
-        written_fields = 0
-        for k, v in row.items():
-            if k == "image_id":
-                continue
-            if v is None:
-                continue
-            written_fields += 1
-        row["written_fields"] = written_fields
+        row = _build_full_row(
+            image_id=image_id,
+            grid_rows=grid_rows,
+            grid_cols=grid_cols,
+            min_stars_per_cell=min_stars_per_cell,
+            n_input_stars=n_input_stars,
+            n_cells_with_data=int(n_cells_with_data),
+            cell_n=cell_n,
+            cell_f_med=cell_f_med,
+            cell_e_med=cell_e_med,
+            center=center,
+            corner_med=corner_med,
+            center_to_corner=center_to_corner,
+            left_right=left_right,
+            top_bottom=top_bottom,
+            fwhm_cell_median_overall=fwhm_cell_median_overall,
+            fwhm_cell_iqr_overall=fwhm_cell_iqr_overall,
+            fwhm_cell_min=fwhm_cell_min,
+            fwhm_cell_max=fwhm_cell_max,
+            fwhm_cell_range=fwhm_cell_range,
+            fwhm_center_minus_corner=fwhm_center_minus_corner,
+            fwhm_left_right_delta=fwhm_left_right_delta,
+            fwhm_top_bottom_delta=fwhm_top_bottom_delta,
+            ecc_cell_median_overall=ecc_cell_median_overall,
+            ecc_cell_max=ecc_cell_max,
+            ecc_center=ecc_center,
+            ecc_corners_median=ecc_corners_median,
+            ecc_center_minus_corners=ecc_center_minus_corners,
+            usable=int(usable),
+            reason=str(reason),
+        )
 
         fields_for_logging: Dict[str, Any] = {
             "grid_rows": grid_rows,
@@ -348,131 +310,21 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             "reason": str(reason),
         }
 
-        with Database().transaction() as db:
-            db.execute(
-                """
-                INSERT OR REPLACE INTO psf_grid_metrics (
-                  image_id,
-                  expected_fields, read_fields, written_fields, parse_warnings, db_written_utc,
-                  grid_rows, grid_cols, grid_min_stars_per_cell,
-                  n_input_stars, n_cells_with_data,
+        _write_metrics_row(db_path=None, row=row)
+        _log(logger, cfg, event, row, fields_for_logging, t0)
 
-                  center_fwhm_px, corner_fwhm_px_median, center_to_corner_fwhm_ratio,
-                  left_right_fwhm_ratio, top_bottom_fwhm_ratio,
+        expected_fields = int(row["expected_fields"])
+        written_fields = int(row["written_fields"])
 
-                  fwhm_cell_median_overall, fwhm_cell_iqr_overall,
-                  fwhm_cell_min, fwhm_cell_max, fwhm_cell_range,
-                  fwhm_center_minus_corner, fwhm_left_right_delta, fwhm_top_bottom_delta,
-
-                  ecc_cell_median_overall, ecc_cell_max, ecc_center,
-                  ecc_corners_median, ecc_center_minus_corners,
-
-                  cell_r0c0_n, cell_r0c0_fwhm_px_median, cell_r0c0_ecc_median,
-                  cell_r0c1_n, cell_r0c1_fwhm_px_median, cell_r0c1_ecc_median,
-                  cell_r0c2_n, cell_r0c2_fwhm_px_median, cell_r0c2_ecc_median,
-
-                  cell_r1c0_n, cell_r1c0_fwhm_px_median, cell_r1c0_ecc_median,
-                  cell_r1c1_n, cell_r1c1_fwhm_px_median, cell_r1c1_ecc_median,
-                  cell_r1c2_n, cell_r1c2_fwhm_px_median, cell_r1c2_ecc_median,
-
-                  cell_r2c0_n, cell_r2c0_fwhm_px_median, cell_r2c0_ecc_median,
-                  cell_r2c1_n, cell_r2c1_fwhm_px_median, cell_r2c1_ecc_median,
-                  cell_r2c2_n, cell_r2c2_fwhm_px_median, cell_r2c2_ecc_median,
-
-                  usable, reason
-                ) VALUES (
-                  ?,
-                  ?, ?, ?, ?, ?,
-                  ?, ?, ?,
-                  ?, ?,
-
-                  ?, ?, ?,
-                  ?, ?,
-
-                  ?, ?,
-                  ?, ?, ?,
-                  ?, ?, ?,
-
-                  ?, ?, ?,
-                  ?, ?,
-
-                  ?, ?, ?,
-                  ?, ?, ?,
-                  ?, ?, ?,
-
-                  ?, ?, ?,
-                  ?, ?, ?,
-                  ?, ?, ?,
-
-                  ?, ?, ?,
-                  ?, ?, ?,
-                  ?, ?, ?,
-
-                  ?, ?
-                )
-                """,
-                (
-                    row["image_id"],
-                    row["expected_fields"], row["read_fields"], row["written_fields"], row["parse_warnings"], row["db_written_utc"],
-                    row["grid_rows"], row["grid_cols"], row["grid_min_stars_per_cell"],
-                    row["n_input_stars"], row["n_cells_with_data"],
-
-                    row["center_fwhm_px"], row["corner_fwhm_px_median"], row["center_to_corner_fwhm_ratio"],
-                    row["left_right_fwhm_ratio"], row["top_bottom_fwhm_ratio"],
-
-                    row["fwhm_cell_median_overall"], row["fwhm_cell_iqr_overall"],
-                    row["fwhm_cell_min"], row["fwhm_cell_max"], row["fwhm_cell_range"],
-                    row["fwhm_center_minus_corner"], row["fwhm_left_right_delta"], row["fwhm_top_bottom_delta"],
-
-                    row["ecc_cell_median_overall"], row["ecc_cell_max"], row["ecc_center"],
-                    row["ecc_corners_median"], row["ecc_center_minus_corners"],
-
-                    row["cell_r0c0_n"], row["cell_r0c0_fwhm_px_median"], row["cell_r0c0_ecc_median"],
-                    row["cell_r0c1_n"], row["cell_r0c1_fwhm_px_median"], row["cell_r0c1_ecc_median"],
-                    row["cell_r0c2_n"], row["cell_r0c2_fwhm_px_median"], row["cell_r0c2_ecc_median"],
-
-                    row["cell_r1c0_n"], row["cell_r1c0_fwhm_px_median"], row["cell_r1c0_ecc_median"],
-                    row["cell_r1c1_n"], row["cell_r1c1_fwhm_px_median"], row["cell_r1c1_ecc_median"],
-                    row["cell_r1c2_n"], row["cell_r1c2_fwhm_px_median"], row["cell_r1c2_ecc_median"],
-
-                    row["cell_r2c0_n"], row["cell_r2c0_fwhm_px_median"], row["cell_r2c0_ecc_median"],
-                    row["cell_r2c1_n"], row["cell_r2c1_fwhm_px_median"], row["cell_r2c1_ecc_median"],
-                    row["cell_r2c2_n"], row["cell_r2c2_fwhm_px_median"], row["cell_r2c2_ecc_median"],
-
-                    row["usable"], row["reason"],
-                ),
-            )
-
-            duration_us = int((time.monotonic() - t0) * 1_000_000)
-            duration_ms = int(duration_us // 1000)
-
-            _insert_module_run(
-                db,
-                image_id,
-                expected_read=row["expected_fields"],
-                read=row["read_fields"],
-                written=row["written_fields"],
-                status="ok",
-                message=None,
-                started_utc=started_utc,
-                ended_utc=utc_now(),
-                duration_ms=duration_ms,
-                duration_us=duration_us,
-            )
-
-        logger.log_module_result(
-            module=MODULE_NAME,
-            file=str(event.file_path),
-            expected_read=row["expected_fields"],
-            read=row["read_fields"],
-            expected_written=row["expected_fields"],
-            written=row["written_fields"],
+        return ModuleRunRecord(
+            image_id=int(image_id),
+            expected_read=expected_fields,
+            read=expected_fields,
+            expected_written=expected_fields,
+            written=written_fields,
             status="OK",
-            duration_s=time.monotonic() - t0,
-            verbose_fields=fields_for_logging if cfg.logging.is_verbose(MODULE_NAME) else None,
+            message=None if usable == 1 else str(reason),
         )
-
-        return None
 
     except Exception as e:
         logger.log_failure(
@@ -482,16 +334,39 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             reason=f"{type(e).__name__}:{e}",
             duration_s=time.monotonic() - t0,
         )
+
+        if image_id is not None:
+            return ModuleRunRecord(
+                image_id=int(image_id),
+                expected_read=int(expected_fields) if expected_fields else 0,
+                read=0,
+                expected_written=int(expected_fields) if expected_fields else 0,
+                written=0,
+                status="FAILED",
+                message=f"{type(e).__name__}:{e}",
+            )
+
         return False
 
 
-def _build_empty_row(*, grid_rows: int, grid_cols: int, min_stars_per_cell: int, n_input_stars: int, reason: str) -> Dict[str, Any]:
+def _build_empty_row(
+    *,
+    image_id: int,
+    grid_rows: int,
+    grid_cols: int,
+    min_stars_per_cell: int,
+    n_input_stars: int,
+    reason: str,
+) -> Dict[str, Any]:
     row: Dict[str, Any] = {
+        "image_id": int(image_id),
+
         "expected_fields": 0,
         "read_fields": 0,
         "written_fields": 0,
         "parse_warnings": None,
         "db_written_utc": utc_now(),
+
         "grid_rows": int(grid_rows),
         "grid_cols": int(grid_cols),
         "grid_min_stars_per_cell": int(min_stars_per_cell),
@@ -529,23 +404,102 @@ def _build_empty_row(*, grid_rows: int, grid_cols: int, min_stars_per_cell: int,
             row[f"cell_r{r}c{c}_fwhm_px_median"] = None
             row[f"cell_r{r}c{c}_ecc_median"] = None
 
-    expected_fields = len(row)
+    # expected/read/written counts should ignore image_id
+    expected_fields = sum(1 for k in row.keys() if k != "image_id")
     row["expected_fields"] = expected_fields
     row["read_fields"] = expected_fields
-    row["written_fields"] = sum(1 for v in row.values() if v is not None)
+    row["written_fields"] = sum(1 for k, v in row.items() if k != "image_id" and v is not None)
     return row
 
 
-def _write_row_and_log(
-    cfg: AppConfig,
-    logger: Logger,
-    event: FileReadyEvent,
+def _build_full_row(
+    *,
     image_id: int,
-    row: Dict[str, Any],
-    fields_for_logging: Dict[str, Any],
-    started_utc: str,
-    t0: float,
-) -> None:
+    grid_rows: int,
+    grid_cols: int,
+    min_stars_per_cell: int,
+    n_input_stars: int,
+    n_cells_with_data: int,
+    cell_n: List[List[int]],
+    cell_f_med: List[List[Optional[float]]],
+    cell_e_med: List[List[Optional[float]]],
+    center: Optional[float],
+    corner_med: Optional[float],
+    center_to_corner: Optional[float],
+    left_right: Optional[float],
+    top_bottom: Optional[float],
+    fwhm_cell_median_overall: Optional[float],
+    fwhm_cell_iqr_overall: Optional[float],
+    fwhm_cell_min: Optional[float],
+    fwhm_cell_max: Optional[float],
+    fwhm_cell_range: Optional[float],
+    fwhm_center_minus_corner: Optional[float],
+    fwhm_left_right_delta: Optional[float],
+    fwhm_top_bottom_delta: Optional[float],
+    ecc_cell_median_overall: Optional[float],
+    ecc_cell_max: Optional[float],
+    ecc_center: Optional[float],
+    ecc_corners_median: Optional[float],
+    ecc_center_minus_corners: Optional[float],
+    usable: int,
+    reason: str,
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "image_id": int(image_id),
+
+        "expected_fields": 0,
+        "read_fields": 0,
+        "written_fields": 0,
+        "parse_warnings": None,
+        "db_written_utc": utc_now(),
+
+        "grid_rows": int(grid_rows),
+        "grid_cols": int(grid_cols),
+        "grid_min_stars_per_cell": int(min_stars_per_cell),
+
+        "n_input_stars": int(n_input_stars),
+        "n_cells_with_data": int(n_cells_with_data),
+
+        "center_fwhm_px": center,
+        "corner_fwhm_px_median": corner_med,
+        "center_to_corner_fwhm_ratio": center_to_corner,
+        "left_right_fwhm_ratio": left_right,
+        "top_bottom_fwhm_ratio": top_bottom,
+
+        "fwhm_cell_median_overall": fwhm_cell_median_overall,
+        "fwhm_cell_iqr_overall": fwhm_cell_iqr_overall,
+        "fwhm_cell_min": fwhm_cell_min,
+        "fwhm_cell_max": fwhm_cell_max,
+        "fwhm_cell_range": fwhm_cell_range,
+        "fwhm_center_minus_corner": fwhm_center_minus_corner,
+        "fwhm_left_right_delta": fwhm_left_right_delta,
+        "fwhm_top_bottom_delta": fwhm_top_bottom_delta,
+
+        "ecc_cell_median_overall": ecc_cell_median_overall,
+        "ecc_cell_max": ecc_cell_max,
+        "ecc_center": ecc_center,
+        "ecc_corners_median": ecc_corners_median,
+        "ecc_center_minus_corners": ecc_center_minus_corners,
+
+        "usable": int(usable),
+        "reason": str(reason),
+    }
+
+    for r in range(3):
+        for c in range(3):
+            row[f"cell_r{r}c{c}_n"] = int(cell_n[r][c])
+            row[f"cell_r{r}c{c}_fwhm_px_median"] = cell_f_med[r][c]
+            row[f"cell_r{r}c{c}_ecc_median"] = cell_e_med[r][c]
+
+    expected_fields = sum(1 for k in row.keys() if k != "image_id")
+    row["expected_fields"] = expected_fields
+    row["read_fields"] = expected_fields
+    row["written_fields"] = sum(1 for k, v in row.items() if k != "image_id" and v is not None)
+    return row
+
+
+def _write_metrics_row(db_path: Optional[Any], row: Dict[str, Any]) -> None:
+    # db_path param kept so this can be extended later; currently always uses default Database()
     with Database().transaction() as db:
         db.execute(
             """
@@ -610,7 +564,7 @@ def _write_row_and_log(
             )
             """,
             (
-                image_id,
+                row["image_id"],
                 row["expected_fields"], row["read_fields"], row["written_fields"], row["parse_warnings"], row["db_written_utc"],
                 row["grid_rows"], row["grid_cols"], row["grid_min_stars_per_cell"],
                 row["n_input_stars"], row["n_cells_with_data"],
@@ -641,30 +595,15 @@ def _write_row_and_log(
             ),
         )
 
-        duration_us = int((time.monotonic() - t0) * 1_000_000)
-        duration_ms = int(duration_us // 1000)
 
-        _insert_module_run(
-            db,
-            image_id,
-            expected_read=row["expected_fields"],
-            read=row["read_fields"],
-            written=row["written_fields"],
-            status="ok",
-            message="skipped_psf_grid",
-            started_utc=started_utc,
-            ended_utc=utc_now(),
-            duration_ms=duration_ms,
-            duration_us=duration_us,
-        )
-
+def _log(logger: Logger, cfg: AppConfig, event: FileReadyEvent, row: Dict[str, Any], fields_for_logging: Dict[str, Any], t0: float) -> None:
     logger.log_module_result(
         module=MODULE_NAME,
         file=str(event.file_path),
-        expected_read=row["expected_fields"],
-        read=row["read_fields"],
-        expected_written=row["expected_fields"],
-        written=row["written_fields"],
+        expected_read=int(row["expected_fields"]),
+        read=int(row["read_fields"]),
+        expected_written=int(row["expected_fields"]),
+        written=int(row["written_fields"]),
         status="OK",
         duration_s=time.monotonic() - t0,
         verbose_fields=fields_for_logging if cfg.logging.is_verbose(MODULE_NAME) else None,

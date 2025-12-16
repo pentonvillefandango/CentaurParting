@@ -6,12 +6,14 @@
 # python3 centaur/sanity_check.py --db data/centaurparting.db \
 #   --out data/sanity_report.csv \
 #   --summary data/sanity_summary.json \
-#   --perf data/sanity_performance.csv
+#   --perf data/sanity_performance.csv \
+#   --runs data/sanity_module_runs_checks.csv
 #
-# outputs (default if you omit --out/--summary/--perf):
+# outputs (default if you omit --out/--summary/--perf/--runs):
 #   data/sanity_report_YYYYMMDD_HHMMSS.csv
 #   data/sanity_summary_YYYYMMDD_HHMMSS.json
 #   data/sanity_performance_YYYYMMDD_HHMMSS.csv
+#   data/sanity_module_runs_checks_YYYYMMDD_HHMMSS.csv
 # ---------------------------------------------
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import csv
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -78,6 +80,15 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _safe_int(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        return int(x)
+    except Exception:
+        return None
+
+
 def _clamp01(v: Optional[float]) -> bool:
     if v is None:
         return True
@@ -98,6 +109,28 @@ def _median(vals: List[float]) -> Optional[float]:
 def _append_anom(anoms: List[str], msg: str) -> None:
     if msg and msg not in anoms:
         anoms.append(msg)
+
+
+def _parse_iso_utc(s: Any) -> Optional[datetime]:
+    """
+    Best-effort parse of ISO timestamps we write (with timezone).
+    Returns aware datetime in UTC, or None.
+    """
+    if s is None:
+        return None
+    if not isinstance(s, str):
+        return None
+    ss = s.strip()
+    if not ss:
+        return None
+    try:
+        dt = datetime.fromisoformat(ss)
+        if dt.tzinfo is None:
+            # assume UTC if missing tz (shouldn't happen, but keep robust)
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 # -----------------------------
@@ -154,6 +187,18 @@ class ImageRow:
     psf1_duration_ms: Optional[int] = None
     psf_grid_duration_ms: Optional[int] = None
     psf2_duration_ms: Optional[int] = None
+
+    # NEW: duration_us (pipeline-owned)
+    fits_duration_us: Optional[int] = None
+    sky_basic_duration_us: Optional[int] = None
+    sky_bkg2d_duration_us: Optional[int] = None
+    exposure_duration_us: Optional[int] = None
+    flat_group_duration_us: Optional[int] = None
+    flat_basic_duration_us: Optional[int] = None
+    psf0_duration_us: Optional[int] = None
+    psf1_duration_us: Optional[int] = None
+    psf_grid_duration_us: Optional[int] = None
+    psf2_duration_us: Optional[int] = None
 
     psf2_ms_per_star: Optional[float] = None
 
@@ -449,12 +494,19 @@ def _check_psf2(conn: sqlite3.Connection, row: ImageRow, anoms: List[str]) -> No
 # Performance helpers
 # -----------------------------
 
-def _module_duration(conn: sqlite3.Connection, image_id: int, module_name: str) -> Optional[int]:
+def _module_duration_ms(conn: sqlite3.Connection, image_id: int, module_name: str) -> Optional[int]:
+    """
+    Backward-compatible: prefer duration_us if present, else duration_ms.
+    """
     if not _table_exists(conn, "module_runs"):
         return None
+
+    has_us = _col_exists(conn, "module_runs", "duration_us")
+    cols = "duration_us, duration_ms" if has_us else "duration_ms"
+
     r = conn.execute(
-        """
-        SELECT duration_ms
+        f"""
+        SELECT {cols}
         FROM module_runs
         WHERE image_id=?
           AND module_name=?
@@ -465,12 +517,34 @@ def _module_duration(conn: sqlite3.Connection, image_id: int, module_name: str) 
     ).fetchone()
     if not r:
         return None
-    try:
-        if r["duration_ms"] is None:
-            return None
-        return int(r["duration_ms"])
-    except Exception:
+
+    if has_us:
+        dus = _safe_int(r["duration_us"])
+        if dus is not None:
+            return int(dus // 1000)
+
+    return _safe_int(r["duration_ms"])
+
+
+def _module_duration_us(conn: sqlite3.Connection, image_id: int, module_name: str) -> Optional[int]:
+    if not _table_exists(conn, "module_runs"):
         return None
+    if not _col_exists(conn, "module_runs", "duration_us"):
+        return None
+    r = conn.execute(
+        """
+        SELECT duration_us
+        FROM module_runs
+        WHERE image_id=?
+          AND module_name=?
+        ORDER BY rowid DESC
+        LIMIT 1
+        """,
+        (image_id, module_name),
+    ).fetchone()
+    if not r:
+        return None
+    return _safe_int(r["duration_us"])
 
 
 def _export_perf_csv_from_views(conn: sqlite3.Connection, out_csv: Path, summary: Dict[str, Any]) -> None:
@@ -564,16 +638,223 @@ def _check_perf_views(conn: sqlite3.Connection, summary: Dict[str, Any]) -> None
 
 
 # -----------------------------
+# NEW: module_runs + routing checks (pipeline-owned)
+# -----------------------------
+
+def _write_module_runs_checks_csv(conn: sqlite3.Connection, out_csv: Path, summary: Dict[str, Any]) -> None:
+    """
+    Writes a standalone CSV describing module_runs/routing/time sanity.
+    Does not change the existing report/perf outputs; it only adds another artifact + summary keys.
+    """
+    summary.setdefault("module_runs_checks", {})
+    summary["module_runs_checks"]["enabled"] = False
+
+    if not _table_exists(conn, "module_runs") or not _table_exists(conn, "fits_header_core"):
+        summary["module_runs_checks"]["error"] = "missing_table:module_runs_or_fits_header_core"
+        return
+
+    has_duration_us = _col_exists(conn, "module_runs", "duration_us")
+    summary["module_runs_checks"]["has_duration_us"] = bool(has_duration_us)
+
+    # Pull a compact dataset
+    rows = conn.execute(
+        """
+        SELECT
+          mr.image_id,
+          mr.module_name,
+          mr.status,
+          mr.expected_fields,
+          mr.read_fields,
+          mr.written_fields,
+          mr.started_utc,
+          mr.ended_utc,
+          mr.duration_us,
+          mr.duration_ms,
+          mr.db_written_utc,
+          UPPER(COALESCE(TRIM(f.imagetyp), '')) AS imagetyp
+        FROM module_runs mr
+        JOIN fits_header_core f USING(image_id)
+        ORDER BY mr.image_id, mr.started_utc, mr.module_name;
+        """
+    ).fetchall()
+
+    # Expectations by frame type (Centaur v1 routing)
+    light_modules = [
+        "fits_header_worker",
+        "sky_basic_worker",
+        "sky_background2d_worker",
+        "exposure_advice_worker",
+        "psf_detect_worker",
+        "psf_basic_worker",
+        "psf_grid_worker",
+        "psf_model_worker",
+    ]
+    flat_modules = [
+        "fits_header_worker",
+        "flat_group_worker",
+        "flat_basic_worker",
+    ]
+
+    def expected_modules_for(imagetyp: str) -> List[str]:
+        if imagetyp == "FLAT":
+            return flat_modules
+        # anything else routes as LIGHT in pipeline
+        return light_modules
+
+    # Aggregations + violations
+    violations: List[Dict[str, Any]] = []
+    by_image: Dict[int, Dict[str, Any]] = {}
+    dup_seen: Dict[Tuple[int, str], int] = {}
+
+    def add_violation(kind: str, image_id: int, module_name: str, detail: str) -> None:
+        violations.append(
+            {
+                "kind": kind,
+                "image_id": image_id,
+                "module_name": module_name,
+                "detail": detail,
+            }
+        )
+
+    # Row-level checks
+    for r in rows:
+        image_id = int(r["image_id"])
+        module_name = str(r["module_name"])
+        imagetyp = str(r["imagetyp"] or "")
+        st = str(r["status"] or "")
+
+        # duplicates by (image_id, module_name)
+        k = (image_id, module_name)
+        dup_seen[k] = dup_seen.get(k, 0) + 1
+        if dup_seen[k] == 2:
+            add_violation("duplicate_image_module", image_id, module_name, "COUNT(image_id,module_name) > 1")
+
+        # timing sanity
+        started = _parse_iso_utc(r["started_utc"])
+        ended = _parse_iso_utc(r["ended_utc"])
+        dbw = _parse_iso_utc(r["db_written_utc"])
+
+        dur_us = _safe_int(r["duration_us"])
+        dur_ms = _safe_int(r["duration_ms"])
+
+        if has_duration_us:
+            if dur_us is None:
+                add_violation("missing_duration_us", image_id, module_name, "duration_us IS NULL")
+            elif dur_us <= 0:
+                add_violation("nonpositive_duration_us", image_id, module_name, f"duration_us={dur_us}")
+        else:
+            # legacy mode: at least ensure duration_ms exists
+            if dur_ms is None:
+                add_violation("missing_duration_ms", image_id, module_name, "duration_ms IS NULL")
+
+        if started is None or ended is None:
+            add_violation("bad_timestamp_parse", image_id, module_name, "started_utc/ended_utc not parseable")
+        else:
+            if ended < started:
+                add_violation("ended_before_started", image_id, module_name, "ended_utc < started_utc")
+            # duration match (tolerate small slack; we use 250ms like your manual check)
+            if dur_us is not None:
+                wall_us = int((ended - started).total_seconds() * 1_000_000)
+                diff_us = abs(int(dur_us) - int(wall_us))
+                if diff_us > 250_000:
+                    add_violation("duration_wall_mismatch_over_250ms", image_id, module_name, f"diff_us={diff_us}")
+
+        # db_written_utc should be >= ended_utc (since pipeline inserts after worker completes)
+        if ended is not None and dbw is not None:
+            if dbw < ended:
+                add_violation("db_written_before_ended", image_id, module_name, "db_written_utc < ended_utc")
+            else:
+                lag_us = int((dbw - ended).total_seconds() * 1_000_000)
+                if lag_us > 1_000_000:
+                    add_violation("db_write_lag_over_1s", image_id, module_name, f"lag_us={lag_us}")
+
+        # per-image aggregation init
+        if image_id not in by_image:
+            by_image[image_id] = {
+                "imagetyp": imagetyp,
+                "modules": [],
+                "statuses": [],
+            }
+        by_image[image_id]["modules"].append(module_name)
+        by_image[image_id]["statuses"].append(st)
+
+    # Per-image routing checks
+    for image_id, info in by_image.items():
+        imagetyp = str(info["imagetyp"] or "")
+        mods = list(info["modules"])
+        expected = expected_modules_for(imagetyp)
+
+        mods_set = set(mods)
+        exp_set = set(expected)
+
+        missing = [m for m in expected if m not in mods_set]
+        extra = [m for m in sorted(mods_set) if m not in exp_set]
+
+        if imagetyp == "FLAT":
+            if len(mods) != 3:
+                add_violation("flat_wrong_module_count", image_id, "(image)", f"n_runs={len(mods)} expected=3")
+        else:
+            # treat unknown/dark/bias as LIGHT routing in pipeline
+            if len(mods) != 8:
+                add_violation("light_wrong_module_count", image_id, "(image)", f"n_runs={len(mods)} expected=8")
+
+        if missing:
+            add_violation("missing_expected_modules", image_id, "(image)", ",".join(missing))
+        if extra:
+            add_violation("unexpected_modules_present", image_id, "(image)", ",".join(extra))
+
+    # Summaries
+    counts: Dict[str, int] = {}
+    for v in violations:
+        counts[v["kind"]] = counts.get(v["kind"], 0) + 1
+
+    summary["module_runs_checks"]["enabled"] = True
+    summary["module_runs_checks"]["n_rows_checked"] = int(len(rows))
+    summary["module_runs_checks"]["n_images_checked"] = int(len(by_image))
+    summary["module_runs_checks"]["violation_counts"] = counts
+    summary["module_runs_checks"]["total_violations"] = int(len(violations))
+
+    # Write CSV
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["section", "module_runs_checks"])
+        w.writerow(["n_rows_checked", len(rows)])
+        w.writerow(["n_images_checked", len(by_image)])
+        w.writerow(["has_duration_us", int(has_duration_us)])
+        w.writerow(["total_violations", len(violations)])
+        w.writerow([])
+
+        w.writerow(["section", "violation_counts"])
+        w.writerow(["kind", "count"])
+        for kind, cnt in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
+            w.writerow([kind, cnt])
+        w.writerow([])
+
+        w.writerow(["section", "violations"])
+        w.writerow(["kind", "image_id", "module_name", "detail"])
+        for v in violations:
+            w.writerow([v["kind"], v["image_id"], v["module_name"], v["detail"]])
+
+
+# -----------------------------
 # Main report generation
 # -----------------------------
 
-def run(db_path: Path, out_csv: Optional[Path], out_json: Optional[Path], out_perf_csv: Optional[Path]) -> int:
+def run(
+    db_path: Path,
+    out_csv: Optional[Path],
+    out_json: Optional[Path],
+    out_perf_csv: Optional[Path],
+    out_runs_csv: Optional[Path],
+) -> int:
     conn = _connect(db_path)
 
     stamp = _now_stamp()
     out_csv = out_csv or (Path("data") / f"sanity_report_{stamp}.csv")
     out_json = out_json or (Path("data") / f"sanity_summary_{stamp}.json")
     out_perf_csv = out_perf_csv or (Path("data") / f"sanity_performance_{stamp}.csv")
+    out_runs_csv = out_runs_csv or (Path("data") / f"sanity_module_runs_checks_{stamp}.csv")
 
     images = _fetch_images(conn)
     mod_ok = _module_run_ok_map(conn)
@@ -590,6 +871,7 @@ def run(db_path: Path, out_csv: Optional[Path], out_json: Optional[Path], out_pe
             "report_csv": str(out_csv),
             "summary_json": str(out_json),
             "performance_csv": str(out_perf_csv),
+            "module_runs_checks_csv": str(out_runs_csv),
         },
     }
 
@@ -598,7 +880,7 @@ def run(db_path: Path, out_csv: Optional[Path], out_json: Optional[Path], out_pe
         "fits_header_core",
         "sky_basic_metrics",
         "sky_background2d_metrics",
-        "exposure_advice",
+        "exposure_advice",  # note: advice table name in this repo
         "psf_detect_metrics",
         "psf_basic_metrics",
         "psf_grid_metrics",
@@ -614,6 +896,9 @@ def run(db_path: Path, out_csv: Optional[Path], out_json: Optional[Path], out_pe
     # View checks + view-export
     _check_perf_views(conn, summary)
     _export_perf_csv_from_views(conn, out_perf_csv, summary)
+
+    # NEW: pipeline/module_runs/routing checks export
+    _write_module_runs_checks_csv(conn, out_runs_csv, summary)
 
     rows_out: List[ImageRow] = []
 
@@ -683,16 +968,28 @@ def run(db_path: Path, out_csv: Optional[Path], out_json: Optional[Path], out_pe
                     _append_anom(anoms, "flat_metrics_missing_row")
 
         # per-image durations (from module_runs)
-        row.fits_duration_ms = _module_duration(conn, image_id, "fits_header_worker")
-        row.sky_basic_duration_ms = _module_duration(conn, image_id, "sky_basic_worker")
-        row.sky_bkg2d_duration_ms = _module_duration(conn, image_id, "sky_background2d_worker")
-        row.exposure_duration_ms = _module_duration(conn, image_id, "exposure_advice_worker")
-        row.flat_group_duration_ms = _module_duration(conn, image_id, "flat_group_worker")
-        row.flat_basic_duration_ms = _module_duration(conn, image_id, "flat_basic_worker")
-        row.psf0_duration_ms = _module_duration(conn, image_id, "psf_detect_worker")
-        row.psf1_duration_ms = _module_duration(conn, image_id, "psf_basic_worker")
-        row.psf_grid_duration_ms = _module_duration(conn, image_id, "psf_grid_worker")
-        row.psf2_duration_ms = _module_duration(conn, image_id, "psf_model_worker")
+        row.fits_duration_ms = _module_duration_ms(conn, image_id, "fits_header_worker")
+        row.sky_basic_duration_ms = _module_duration_ms(conn, image_id, "sky_basic_worker")
+        row.sky_bkg2d_duration_ms = _module_duration_ms(conn, image_id, "sky_background2d_worker")
+        row.exposure_duration_ms = _module_duration_ms(conn, image_id, "exposure_advice_worker")
+        row.flat_group_duration_ms = _module_duration_ms(conn, image_id, "flat_group_worker")
+        row.flat_basic_duration_ms = _module_duration_ms(conn, image_id, "flat_basic_worker")
+        row.psf0_duration_ms = _module_duration_ms(conn, image_id, "psf_detect_worker")
+        row.psf1_duration_ms = _module_duration_ms(conn, image_id, "psf_basic_worker")
+        row.psf_grid_duration_ms = _module_duration_ms(conn, image_id, "psf_grid_worker")
+        row.psf2_duration_ms = _module_duration_ms(conn, image_id, "psf_model_worker")
+
+        # NEW: duration_us columns (pipeline-owned)
+        row.fits_duration_us = _module_duration_us(conn, image_id, "fits_header_worker")
+        row.sky_basic_duration_us = _module_duration_us(conn, image_id, "sky_basic_worker")
+        row.sky_bkg2d_duration_us = _module_duration_us(conn, image_id, "sky_background2d_worker")
+        row.exposure_duration_us = _module_duration_us(conn, image_id, "exposure_advice_worker")
+        row.flat_group_duration_us = _module_duration_us(conn, image_id, "flat_group_worker")
+        row.flat_basic_duration_us = _module_duration_us(conn, image_id, "flat_basic_worker")
+        row.psf0_duration_us = _module_duration_us(conn, image_id, "psf_detect_worker")
+        row.psf1_duration_us = _module_duration_us(conn, image_id, "psf_basic_worker")
+        row.psf_grid_duration_us = _module_duration_us(conn, image_id, "psf_grid_worker")
+        row.psf2_duration_us = _module_duration_us(conn, image_id, "psf_model_worker")
 
         if row.psf2_duration_ms is not None and row.psf2_n_modeled and row.psf2_n_modeled > 0:
             row.psf2_ms_per_star = float(row.psf2_duration_ms) / float(row.psf2_n_modeled)
@@ -728,7 +1025,7 @@ def run(db_path: Path, out_csv: Optional[Path], out_json: Optional[Path], out_pe
             "psf2_n_modeled",
             "psf2_gauss_fwhm_med", "psf2_gauss_fwhm_p90", "psf2_gauss_ecc_med",
 
-            # durations
+            # durations (ms, for continuity)
             "fits_duration_ms",
             "sky_basic_duration_ms",
             "sky_bkg2d_duration_ms",
@@ -739,6 +1036,19 @@ def run(db_path: Path, out_csv: Optional[Path], out_json: Optional[Path], out_pe
             "psf1_duration_ms",
             "psf_grid_duration_ms",
             "psf2_duration_ms",
+
+            # NEW: durations (us)
+            "fits_duration_us",
+            "sky_basic_duration_us",
+            "sky_bkg2d_duration_us",
+            "exposure_duration_us",
+            "flat_group_duration_us",
+            "flat_basic_duration_us",
+            "psf0_duration_us",
+            "psf1_duration_us",
+            "psf_grid_duration_us",
+            "psf2_duration_us",
+
             "psf2_ms_per_star",
 
             "anomalies",
@@ -775,6 +1085,18 @@ def run(db_path: Path, out_csv: Optional[Path], out_json: Optional[Path], out_pe
                 r.psf1_duration_ms,
                 r.psf_grid_duration_ms,
                 r.psf2_duration_ms,
+
+                r.fits_duration_us,
+                r.sky_basic_duration_us,
+                r.sky_bkg2d_duration_us,
+                r.exposure_duration_us,
+                r.flat_group_duration_us,
+                r.flat_basic_duration_us,
+                r.psf0_duration_us,
+                r.psf1_duration_us,
+                r.psf_grid_duration_us,
+                r.psf2_duration_us,
+
                 r.psf2_ms_per_star,
 
                 r.anomalies,
@@ -790,6 +1112,19 @@ def run(db_path: Path, out_csv: Optional[Path], out_json: Optional[Path], out_pe
     print(f"[sanity_check] report={out_csv}")
     print(f"[sanity_check] summary={out_json}")
     print(f"[sanity_check] performance={out_perf_csv}")
+    print(f"[sanity_check] module_runs_checks={out_runs_csv}")
+
+    # Also surface module_runs violations in stdout (top 10 kinds)
+    mrc = summary.get("module_runs_checks", {})
+    if isinstance(mrc, dict) and mrc.get("enabled") and isinstance(mrc.get("violation_counts"), dict):
+        vc = mrc["violation_counts"]
+        total_v = int(mrc.get("total_violations", 0) or 0)
+        if total_v > 0:
+            topk = sorted(vc.items(), key=lambda kv: kv[1], reverse=True)[:10]
+            print(f"[sanity_check] module_runs_violations_total={total_v}")
+            for k, v in topk:
+                print(f"  module_runs::{k}: {v}")
+
     if summary["anomaly_counts"]:
         top = sorted(summary["anomaly_counts"].items(), key=lambda kv: kv[1], reverse=True)[:10]
         for k, v in top:
@@ -807,14 +1142,16 @@ def main() -> int:
     ap.add_argument("--out", type=str, default="", help="Output CSV path (blank = auto timestamp)")
     ap.add_argument("--summary", type=str, default="", help="Output JSON summary path (blank = auto timestamp)")
     ap.add_argument("--perf", type=str, default="", help="Output performance CSV path (blank = auto timestamp)")
+    ap.add_argument("--runs", type=str, default="", help="Output module_runs checks CSV path (blank = auto timestamp)")
 
     args = ap.parse_args()
 
     out_csv = Path(args.out) if args.out.strip() else None
     out_json = Path(args.summary) if args.summary.strip() else None
     out_perf = Path(args.perf) if args.perf.strip() else None
+    out_runs = Path(args.runs) if args.runs.strip() else None
 
-    return run(Path(args.db), out_csv, out_json, out_perf)
+    return run(Path(args.db), out_csv, out_json, out_perf, out_runs)
 
 
 if __name__ == "__main__":

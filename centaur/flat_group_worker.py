@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Any
 
 from zoneinfo import ZoneInfo
 
@@ -12,49 +12,15 @@ from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
 
+# NEW: structured return so pipeline writes module_runs centrally (with duration_us)
+from centaur.pipeline import ModuleRunRecord
+
 MODULE_NAME = "flat_group_worker"
 LOCAL_TZ = ZoneInfo("Europe/London")
 
 
 def utc_now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
-
-
-def _insert_module_run(
-    db: Database,
-    image_id: int,
-    *,
-    expected_read: int,
-    read: int,
-    written: int,
-    status: str,
-    message: Optional[str],
-    started_utc: str,
-    ended_utc: str,
-    duration_ms: int,
-) -> None:
-    db.execute(
-        """
-        INSERT INTO module_runs
-        (image_id, module_name, expected_fields, read_fields, written_fields,
-         status, message, started_utc, ended_utc, duration_ms, db_written_utc)
-        VALUES (?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            image_id,
-            MODULE_NAME,
-            expected_read,
-            read,
-            written,
-            status,
-            message,
-            started_utc,
-            ended_utc,
-            duration_ms,
-            utc_now(),
-        ),
-    )
 
 
 def _is_flat(imagetyp: Optional[str]) -> bool:
@@ -96,7 +62,7 @@ class _FlatProfileKey:
     naxis2: Optional[int]
 
 
-def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Optional[bool]:
+def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Any:
     """
     Create/attach:
       - flat_profiles row (physical compatibility)
@@ -106,8 +72,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
     Runs only when IMAGETYP=FLAT.
     """
     t0 = time.monotonic()
-    started_utc = utc_now()
     file_path = str(event.file_path)
+
+    image_id: Optional[int] = None
 
     try:
         with Database().transaction() as db:
@@ -140,27 +107,23 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     file=file_path,
                     action="continue",
                     reason="missing_fits_header_core",
+                    duration_s=time.monotonic() - t0,
                 )
                 return False
 
             image_id = int(row["image_id"])
 
             if not _is_flat(row["imagetyp"]):
-                # Not applicable, but log a clean module_run so sanity tools can see it ran.
-                ended_utc = utc_now()
-                _insert_module_run(
-                    db,
-                    image_id,
+                # Not applicable: pipeline should still get an OK run record with a message.
+                return ModuleRunRecord(
+                    image_id=image_id,
                     expected_read=1,
                     read=1,
+                    expected_written=0,
                     written=0,
-                    status="ok",
+                    status="OK",
                     message="not_applicable_non_flat",
-                    started_utc=started_utc,
-                    ended_utc=ended_utc,
-                    duration_ms=int((time.monotonic() - t0) * 1000),
                 )
-                return True
 
             camera = (row["camera"] or "").strip()
             filt = (row["filter"] or None)
@@ -298,23 +261,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 ),
             )
 
-            ended_utc = utc_now()
-            duration_ms = int((time.monotonic() - t0) * 1000)
-
-            # module_runs audit (so sanity can mark FLAT modules OK)
-            _insert_module_run(
-                db,
-                image_id,
-                expected_read=1,
-                read=1,
-                written=1,
-                status="ok",
-                message=None,
-                started_utc=started_utc,
-                ended_utc=ended_utc,
-                duration_ms=duration_ms,
-            )
-
         logger.log_module_summary(
             module=MODULE_NAME,
             file=file_path,
@@ -325,7 +271,16 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             status="OK",
             duration_s=time.monotonic() - t0,
         )
-        return True
+
+        return ModuleRunRecord(
+            image_id=int(image_id),
+            expected_read=1,
+            read=1,
+            expected_written=1,
+            written=1,
+            status="OK",
+            message=None,
+        )
 
     except Exception as e:
         logger.log_failure(
@@ -333,5 +288,18 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             file=file_path,
             action="continue",
             reason=f"{type(e).__name__}:{e}",
+            duration_s=time.monotonic() - t0,
         )
+
+        if image_id is not None:
+            return ModuleRunRecord(
+                image_id=int(image_id),
+                expected_read=1,
+                read=0,
+                expected_written=1,
+                written=0,
+                status="FAILED",
+                message=f"{type(e).__name__}:{e}",
+            )
+
         return False

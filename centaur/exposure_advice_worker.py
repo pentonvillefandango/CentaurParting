@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 from centaur.config import AppConfig
 from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
 
+# NEW: structured return so pipeline writes module_runs centrally (with duration_us)
+from centaur.pipeline import ModuleRunRecord
+
 MODULE_NAME = "exposure_advice_worker"
-
-
-def utc_now() -> str:
-    return datetime.now(tz=timezone.utc).isoformat()
 
 
 def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
@@ -23,43 +21,6 @@ def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
         (str(file_path),),
     ).fetchone()
     return int(row["image_id"]) if row else None
-
-
-def _insert_module_run(
-    db: Database,
-    image_id: int,
-    *,
-    expected_read: int,
-    read: int,
-    written: int,
-    status: str,
-    message: Optional[str],
-    started_utc: str,
-    ended_utc: str,
-    duration_ms: int,
-) -> None:
-    db.execute(
-        """
-        INSERT INTO module_runs
-        (image_id, module_name, expected_fields, read_fields, written_fields,
-         status, message, started_utc, ended_utc, duration_ms, db_written_utc)
-        VALUES (?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            image_id,
-            MODULE_NAME,
-            expected_read,
-            read,
-            written,
-            status,
-            message,
-            started_utc,
-            ended_utc,
-            duration_ms,
-            utc_now(),
-        ),
-    )
 
 
 def _extract_gain_setting(db: Database, image_id: int) -> Optional[int]:
@@ -87,17 +48,17 @@ def _extract_gain_setting(db: Database, image_id: int) -> Optional[int]:
     return row["gain_setting"]
 
 
-def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> bool:
+def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Any:
     t0 = time.monotonic()
-    started_utc = utc_now()
 
     # These match your existing logger summaries
     EXPECTED_READ_OK = 6
     EXPECTED_WRITTEN_OK = 7
 
+    image_id: Optional[int] = None
+
     try:
         with Database().transaction() as db:
-            # Resolve image_id early so we can always write module_runs
             image_id = _get_image_id(db, event.file_path)
             if image_id is None:
                 logger.log_failure(
@@ -105,6 +66,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     file=str(event.file_path),
                     action="continue",
                     reason="image_id_not_found",
+                    duration_s=time.monotonic() - t0,
                 )
                 return False
 
@@ -127,27 +89,22 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             ).fetchone()
 
             if row is None:
-                # Record the failure in module_runs as well
-                _insert_module_run(
-                    db,
-                    image_id,
-                    expected_read=EXPECTED_READ_OK,
-                    read=0,
-                    written=0,
-                    status="failed",
-                    message="missing_prerequisites",
-                    started_utc=started_utc,
-                    ended_utc=utc_now(),
-                    duration_ms=int((time.monotonic() - t0) * 1000),
-                )
-
                 logger.log_failure(
                     module=MODULE_NAME,
                     file=str(event.file_path),
                     action="continue",
                     reason="missing_prerequisites",
+                    duration_s=time.monotonic() - t0,
                 )
-                return False
+                return ModuleRunRecord(
+                    image_id=int(image_id),
+                    expected_read=EXPECTED_READ_OK,
+                    read=0,
+                    expected_written=EXPECTED_WRITTEN_OK,
+                    written=0,
+                    status="FAILED",
+                    message="missing_prerequisites",
+                )
 
             camera_name = row["camera_name"] or ""
             sky_rate_adu_s = float(row["sky_rate_adu_s"] or 0.0)
@@ -181,19 +138,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     (image_id, f"missing_camera_constants_for_gain:{gain_setting}"),
                 )
 
-                _insert_module_run(
-                    db,
-                    image_id,
-                    expected_read=5,
-                    read=5,
-                    written=1,
-                    status="ok",
-                    message=f"no_constants_for_gain:{gain_setting}",
-                    started_utc=started_utc,
-                    ended_utc=utc_now(),
-                    duration_ms=int((time.monotonic() - t0) * 1000),
-                )
-
                 logger.log_module_summary(
                     module=MODULE_NAME,
                     file=str(event.file_path),
@@ -204,7 +148,16 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     status=f"OK (no constants for gain={gain_setting})",
                     duration_s=time.monotonic() - t0,
                 )
-                return True
+
+                return ModuleRunRecord(
+                    image_id=int(image_id),
+                    expected_read=5,
+                    read=5,
+                    expected_written=1,
+                    written=1,
+                    status="OK",
+                    message=f"no_constants_for_gain:{gain_setting}",
+                )
 
             gain_e_per_adu = float(const["gain_e_per_adu"])
             read_noise_e = float(const["read_noise_e"])
@@ -221,19 +174,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     (image_id, "invalid_sky_rate"),
                 )
 
-                _insert_module_run(
-                    db,
-                    image_id,
-                    expected_read=5,
-                    read=5,
-                    written=1,
-                    status="ok",
-                    message="invalid_sky_rate",
-                    started_utc=started_utc,
-                    ended_utc=utc_now(),
-                    duration_ms=int((time.monotonic() - t0) * 1000),
-                )
-
                 logger.log_module_summary(
                     module=MODULE_NAME,
                     file=str(event.file_path),
@@ -244,7 +184,16 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     status="OK (invalid sky rate)",
                     duration_s=time.monotonic() - t0,
                 )
-                return True
+
+                return ModuleRunRecord(
+                    image_id=int(image_id),
+                    expected_read=5,
+                    read=5,
+                    expected_written=1,
+                    written=1,
+                    status="OK",
+                    message="invalid_sky_rate",
+                )
 
             # Sky-limited minimum exposure
             def min_exp(k: float) -> float:
@@ -284,19 +233,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 ),
             )
 
-            _insert_module_run(
-                db,
-                image_id,
-                expected_read=EXPECTED_READ_OK,
-                read=EXPECTED_READ_OK,
-                written=EXPECTED_WRITTEN_OK,
-                status="ok",
-                message=None,
-                started_utc=started_utc,
-                ended_utc=utc_now(),
-                duration_ms=int((time.monotonic() - t0) * 1000),
-            )
-
         logger.log_module_summary(
             module=MODULE_NAME,
             file=str(event.file_path),
@@ -307,7 +243,16 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             status="OK",
             duration_s=time.monotonic() - t0,
         )
-        return True
+
+        return ModuleRunRecord(
+            image_id=int(image_id),
+            expected_read=EXPECTED_READ_OK,
+            read=EXPECTED_READ_OK,
+            expected_written=EXPECTED_WRITTEN_OK,
+            written=EXPECTED_WRITTEN_OK,
+            status="OK",
+            message=None,
+        )
 
     except Exception as e:
         logger.log_failure(
@@ -315,5 +260,18 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             file=str(event.file_path),
             action="continue",
             reason=f"{type(e).__name__}:{e}",
+            duration_s=time.monotonic() - t0,
         )
+
+        if image_id is not None:
+            return ModuleRunRecord(
+                image_id=int(image_id),
+                expected_read=EXPECTED_READ_OK,
+                read=0,
+                expected_written=EXPECTED_WRITTEN_OK,
+                written=0,
+                status="FAILED",
+                message=f"{type(e).__name__}:{e}",
+            )
+
         return False

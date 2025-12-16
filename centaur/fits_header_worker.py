@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import json
@@ -13,6 +12,9 @@ from centaur.config import AppConfig
 from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
+
+# NEW: structured return so pipeline writes module_runs centrally (with duration_us)
+from centaur.pipeline import ModuleRunRecord
 
 MODULE_NAME = "fits_header_worker"
 
@@ -132,9 +134,7 @@ def _header_to_json(header: fits.Header) -> str:
     # Preserve duplicates (HISTORY/COMMENT) by storing as list-of-cards
     cards = []
     for card in header.cards:
-        cards.append(
-            {"keyword": str(card.keyword), "value": card.value, "comment": card.comment}
-        )
+        cards.append({"keyword": str(card.keyword), "value": card.value, "comment": card.comment})
     return json.dumps(cards, default=str)
 
 
@@ -236,61 +236,23 @@ def _link_image_setup(db: Database, image_id: int, setup_id: int) -> None:
     )
 
 
-def _insert_module_run(
-    db: Database,
-    image_id: int,
-    *,
-    expected_read: int,
-    read: int,
-    expected_written: int,
-    written: int,
-    status: str,
-    message: Optional[str],
-    started_utc: str,
-    ended_utc: str,
-    duration_ms: int,
-) -> None:
-    now = utc_now()
-    db.execute(
-        """
-        INSERT INTO module_runs
-        (image_id, module_name, expected_fields, read_fields, written_fields,
-         status, message, started_utc, ended_utc, duration_ms, db_written_utc)
-        VALUES (?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            image_id,
-            MODULE_NAME,
-            expected_read,
-            read,
-            written,
-            status,
-            message,
-            started_utc,
-            ended_utc,
-            duration_ms,
-            now,
-        ),
-    )
-
-
-def process_file_event(config: AppConfig, logger: Logger, event: FileReadyEvent) -> None:
+def process_file_event(config: AppConfig, logger: Logger, event: FileReadyEvent) -> Any:
     t0 = time.monotonic()
-    started_utc = utc_now()
 
     expected_read = len(CORE_FIELDS)
     expected_written = len(CORE_FIELDS)
 
+    image_id: Optional[int] = None
+    core: Dict[str, Any] = {}
+    read_count = 0
+    written_count = 0
+
     try:
+        # Read FITS header
         with fits.open(event.file_path, memmap=False) as hdul:
             header = hdul[0].header
             header_json = _header_to_json(header)
             header_bytes = len(header_json.encode("utf-8"))
-
-            core: Dict[str, Any] = {}
-            read_count = 0
-            written_count = 0
 
             for field in CORE_FIELDS:
                 raw = _first_present(header, CORE_KEYWORDS[field])
@@ -301,6 +263,7 @@ def process_file_event(config: AppConfig, logger: Logger, event: FileReadyEvent)
                 if val is not None:
                     written_count += 1
 
+        # Write DB rows (no module_runs here)
         with Database().transaction() as db:
             watch_root_id = _upsert_watch_root(db, event.watch_root_path, event.watch_root_label)
             image_id = _insert_image_row(db, event, watch_root_id)
@@ -336,24 +299,7 @@ def process_file_event(config: AppConfig, logger: Logger, event: FileReadyEvent)
                 setup_id = _create_setup_id(db, telescop, instrume, detector)
             _link_image_setup(db, image_id, setup_id)
 
-            ended_utc = utc_now()
-            duration_ms = int((time.monotonic() - t0) * 1000)
-
-            _insert_module_run(
-                db,
-                image_id,
-                expected_read=expected_read,
-                read=read_count,
-                expected_written=expected_written,
-                written=written_count,
-                status="ok",
-                message=None,
-                started_utc=started_utc,
-                ended_utc=ended_utc,
-                duration_ms=duration_ms,
-            )
-
-        duration_s = time.monotonic() - t0
+        # Logging (unchanged)
         logger.log_module_result(
             module=MODULE_NAME,
             file=str(event.file_path),
@@ -362,17 +308,40 @@ def process_file_event(config: AppConfig, logger: Logger, event: FileReadyEvent)
             expected_written=expected_written,
             written=written_count,
             status="OK",
-            duration_s=duration_s,
+            duration_s=time.monotonic() - t0,
             verbose_fields={k: core.get(k) for k in CORE_FIELDS},
         )
 
+        # Tell pipeline to write module_runs centrally
+        return ModuleRunRecord(
+            image_id=int(image_id),
+            expected_read=int(expected_read),
+            read=int(read_count),
+            expected_written=int(expected_written),
+            written=int(written_count),
+            status="OK",
+            message=None,
+        )
+
     except Exception as e:
-        duration_s = time.monotonic() - t0
         logger.log_failure(
             module=MODULE_NAME,
             file=str(event.file_path),
             action=config.on_metric_failure,
             reason=f"{type(e).__name__}:{e}",
-            duration_s=duration_s,
+            duration_s=time.monotonic() - t0,
         )
 
+        # If we managed to create an image row, let pipeline record a failed run
+        if image_id is not None:
+            return ModuleRunRecord(
+                image_id=int(image_id),
+                expected_read=int(expected_read),
+                read=int(read_count),
+                expected_written=int(expected_written),
+                written=int(written_count),
+                status="FAILED",
+                message=f"{type(e).__name__}:{e}",
+            )
+
+        return False

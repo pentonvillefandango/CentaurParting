@@ -15,6 +15,9 @@ from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
 
+# NEW: pipeline writes module_runs centrally (with duration_us)
+from centaur.pipeline import ModuleRunRecord
+
 MODULE_NAME = "psf_model_worker"
 
 
@@ -92,45 +95,6 @@ def _fetch_psf1_star_xy(db: Database, image_id: int) -> List[Tuple[int, int]]:
         return []
 
 
-def _insert_module_run(
-    db: Database,
-    image_id: int,
-    *,
-    expected_read: int,
-    read: int,
-    written: int,
-    status: str,
-    message: Optional[str],
-    started_utc: str,
-    ended_utc: str,
-    duration_ms: int,
-    duration_us: int,
-) -> None:
-    db.execute(
-        """
-        INSERT INTO module_runs
-        (image_id, module_name, expected_fields, read_fields, written_fields,
-         status, message, started_utc, ended_utc, duration_ms, duration_us, db_written_utc)
-        VALUES (?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            image_id,
-            MODULE_NAME,
-            expected_read,
-            read,
-            written,
-            status,
-            message,
-            started_utc,
-            ended_utc,
-            duration_ms,
-            duration_us,
-            utc_now(),
-        ),
-    )
-
-
 def _moment_gaussian_equiv(data: np.ndarray) -> Optional[Tuple[float, float]]:
     data_pos = np.clip(data, 0.0, None)
     flux = float(np.sum(data_pos))
@@ -153,9 +117,8 @@ def _moment_gaussian_equiv(data: np.ndarray) -> Optional[Tuple[float, float]]:
     return math.sqrt(var_x), math.sqrt(var_y)
 
 
-def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Optional[bool]:
+def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Any:
     t0 = time.monotonic()
-    started_utc = utc_now()
 
     max_stars_cfg = int(getattr(cfg, "psf2_max_stars", 1000))  # 0 = unlimited
     fit_radius = int(getattr(cfg, "psf2_fit_radius_px", 8))
@@ -164,7 +127,11 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
 
     max_stars = 0 if max_stars_cfg <= 0 else max_stars_cfg
 
+    image_id: Optional[int] = None
+    expected_fields = 10  # keep your existing convention for sanity tooling
+
     try:
+        # Resolve prerequisites up front
         with Database().transaction() as db:
             image_id = _get_image_id(db, event.file_path)
             if image_id is None:
@@ -173,9 +140,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             n_input, psf1_usable = _fetch_psf1_summary(db, image_id)
             star_xy = _fetch_psf1_star_xy(db, image_id)
 
-        expected_fields = 10
+        # If PSF-1 not usable, write a minimal row and return OK (skip)
         if psf1_usable != 1 or n_input < 25 or not star_xy:
-            fields = {
+            fields_for_logging = {
                 "n_input_stars": n_input,
                 "n_modeled": 0,
                 "gauss_fwhm_px_median": None,
@@ -225,23 +192,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     ),
                 )
 
-                duration_us = int((time.monotonic() - t0) * 1_000_000)
-                duration_ms = int(duration_us // 1000)
-
-                _insert_module_run(
-                    db,
-                    image_id,
-                    expected_read=expected_fields,
-                    read=expected_fields,
-                    written=2,
-                    status="ok",
-                    message="skipped_psf2",
-                    started_utc=started_utc,
-                    ended_utc=utc_now(),
-                    duration_ms=duration_ms,
-                    duration_us=duration_us,
-                )
-
             logger.log_module_result(
                 module=MODULE_NAME,
                 file=str(event.file_path),
@@ -251,13 +201,24 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 written=2,
                 status="OK",
                 duration_s=time.monotonic() - t0,
-                verbose_fields=fields if cfg.logging.is_verbose(MODULE_NAME) else None,
+                verbose_fields=fields_for_logging if cfg.logging.is_verbose(MODULE_NAME) else None,
             )
-            return None
 
+            return ModuleRunRecord(
+                image_id=int(image_id),
+                expected_read=expected_fields,
+                read=expected_fields,
+                expected_written=expected_fields,
+                written=2,
+                status="OK",
+                message="skipped_psf2",
+            )
+
+        # Cap stars if configured
         if max_stars > 0 and len(star_xy) > max_stars:
             star_xy = star_xy[:max_stars]
 
+        # Load image
         with fits.open(str(event.file_path), memmap=False) as hdul:
             img = np.asarray(hdul[0].data, dtype=np.float64)
 
@@ -329,7 +290,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         usable = int(n_modeled >= min_good_fits)
         reason = "ok" if usable else "too_few_fits"
 
-        fields: Dict[str, Any] = {
+        fields_for_logging: Dict[str, Any] = {
             "n_input_stars": n_input,
             "n_modeled": n_modeled,
             "gauss_fwhm_px_median": gauss_fwhm_med,
@@ -346,10 +307,12 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             "psf2_min_good_fits": min_good_fits,
         }
 
-        written_fields = 2
+        # written_fields for the psf_model_metrics row (simple audit count)
+        written_fields = 2  # n_input_stars + n_modeled
         for k in ("gauss_fwhm_px_median", "gauss_fwhm_px_iqr", "gauss_fwhm_px_p90", "gauss_ecc_median"):
-            if fields[k] is not None:
+            if fields_for_logging.get(k) is not None:
                 written_fields += 1
+        written_fields += 2  # usable + reason always written
 
         with Database().transaction() as db:
             db.execute(
@@ -388,23 +351,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 ),
             )
 
-            duration_us = int((time.monotonic() - t0) * 1_000_000)
-            duration_ms = int(duration_us // 1000)
-
-            _insert_module_run(
-                db,
-                image_id,
-                expected_read=expected_fields,
-                read=expected_fields,
-                written=written_fields,
-                status="ok",
-                message=None,
-                started_utc=started_utc,
-                ended_utc=utc_now(),
-                duration_ms=duration_ms,
-                duration_us=duration_us,
-            )
-
         logger.log_module_result(
             module=MODULE_NAME,
             file=str(event.file_path),
@@ -414,9 +360,18 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             written=written_fields,
             status="OK",
             duration_s=time.monotonic() - t0,
-            verbose_fields=fields if cfg.logging.is_verbose(MODULE_NAME) else None,
+            verbose_fields=fields_for_logging if cfg.logging.is_verbose(MODULE_NAME) else None,
         )
-        return None
+
+        return ModuleRunRecord(
+            image_id=int(image_id),
+            expected_read=expected_fields,
+            read=expected_fields,
+            expected_written=expected_fields,
+            written=written_fields,
+            status="OK",
+            message=None if usable == 1 else reason,
+        )
 
     except Exception as e:
         logger.log_failure(
@@ -426,4 +381,16 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             reason=f"{type(e).__name__}:{e}",
             duration_s=time.monotonic() - t0,
         )
+
+        if image_id is not None:
+            return ModuleRunRecord(
+                image_id=int(image_id),
+                expected_read=int(expected_fields) if expected_fields else 0,
+                read=0,
+                expected_written=int(expected_fields) if expected_fields else 0,
+                written=0,
+                status="FAILED",
+                message=f"{type(e).__name__}:{e}",
+            )
+
         return False

@@ -15,6 +15,9 @@ from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
 
+# NEW: return a structured run record so pipeline can write module_runs centrally
+from centaur.pipeline import ModuleRunRecord
+
 MODULE_NAME = "sky_basic_worker"
 
 
@@ -120,7 +123,6 @@ def _compute_stats(values_1d: np.ndarray) -> SkyStats:
             clipped_fraction=None,
         )
 
-    # Remove NaN/Inf for the *raw* distribution stats
     finite = values_1d[np.isfinite(values_1d)]
     if finite.size == 0:
         return SkyStats(
@@ -131,27 +133,20 @@ def _compute_stats(values_1d: np.ndarray) -> SkyStats:
             clipped_fraction=None,
         )
 
-    # Raw stats
     mean = _safe_float(np.mean(finite))
     median = _safe_float(np.median(finite))
     std = _safe_float(np.std(finite))
     vmin = _safe_float(np.min(finite))
     vmax = _safe_float(np.max(finite))
 
-    # Percentiles
-    p10, p25, p50, p75, p90, p99, p999 = [ _safe_float(x) for x in np.percentile(
-        finite, [10, 25, 50, 75, 90, 99, 99.9]
-    ) ]
+    p10, p25, p50, p75, p90, p99, p999 = [
+        _safe_float(x) for x in np.percentile(finite, [10, 25, 50, 75, 90, 99, 99.9])
+    ]
 
-    # IQR
     iqr = _safe_float(p75 - p25) if (p75 is not None and p25 is not None) else None
-
-    # Mode estimate (simple & common): mode ≈ 3*median - 2*mean
     mode = _safe_float(3 * median - 2 * mean) if (median is not None and mean is not None) else None
 
-    # Sigma clipping for robust sky (reject stars / bright pixels)
     clipped = sigma_clip(finite, sigma=3.0, maxiters=5, masked=True)
-    # Masked array: mask=True means clipped out
     mask = np.asarray(clipped.mask)
     kept = finite[~mask] if mask.size else finite
 
@@ -191,9 +186,6 @@ def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
 
 
 def _get_exptime_s(db: Database, image_id: int) -> Optional[float]:
-    """
-    Read exposure time from fits_header_core (preferred) if available.
-    """
     row = db.execute(
         "SELECT exptime FROM fits_header_core WHERE image_id = ?",
         (image_id,),
@@ -203,62 +195,25 @@ def _get_exptime_s(db: Database, image_id: int) -> Optional[float]:
     return _safe_float(row["exptime"])
 
 
-def _insert_module_run(
-    db: Database,
-    image_id: int,
-    *,
-    expected_read: int,
-    read: int,
-    written: int,
-    status: str,
-    message: Optional[str],
-    started_utc: str,
-    ended_utc: str,
-    duration_ms: int,
-) -> None:
-    db.execute(
-        """
-        INSERT INTO module_runs
-        (image_id, module_name, expected_fields, read_fields, written_fields,
-         status, message, started_utc, ended_utc, duration_ms, db_written_utc)
-        VALUES (?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            image_id,
-            MODULE_NAME,
-            expected_read,
-            read,
-            written,
-            status,
-            message,
-            started_utc,
-            ended_utc,
-            duration_ms,
-            utc_now(),
-        ),
-    )
-
-
-def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Optional[bool]:
+def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Any:
     """
     Compute Sky Basic metrics from the image data and write to DB.
 
-    Returns:
-      - None (we rely on logging + module_runs; pipeline treats None as OK)
+    NEW BEHAVIOR (for module_runs centralization):
+    - This worker NO LONGER inserts into module_runs.
+    - If we successfully obtain image_id, we return a ModuleRunRecord so the pipeline
+      can insert into module_runs centrally (with consistent duration_us).
     """
     t0 = time.monotonic()
-    started_utc = utc_now()
 
-    # We will compute these for BOTH full frame + ROI
     roi_fraction = 0.5
-
-    # Expected metric count (roughly: number of columns we intend to populate)
-    # We'll count “fields” as: all computed stats + derived rates + health
     expected_fields = 0
+    read_fields = 0
+    written_fields = 0
+    image_id: Optional[int] = None
+    fields: Dict[str, Any] = {}
 
     try:
-        # Read image data
         with fits.open(event.file_path, memmap=False) as hdul:
             data = hdul[0].data
 
@@ -268,25 +223,20 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
 
         nan_fraction, inf_fraction = _nan_inf_fractions(arr2d)
 
-        # Full frame
         ff_vals = arr2d.reshape(-1)
         ff_stats = _compute_stats(ff_vals)
 
-        # ROI
         roi2d = _central_roi(arr2d, roi_fraction=roi_fraction)
         roi_vals = roi2d.reshape(-1)
         roi_stats = _compute_stats(roi_vals)
 
-        # DB write
         with Database().transaction() as db:
             image_id = _get_image_id(db, event.file_path)
             if image_id is None:
-                # This means fits_header_worker didn't run or didn't insert images row.
                 raise RuntimeError("image_id_not_found_for_file_path")
 
             exptime_s = _get_exptime_s(db, image_id)
 
-            # Derived rates (ADU/s) if possible
             if exptime_s is not None and exptime_s > 0:
                 ff_median_adu_s = _safe_float(ff_stats.median / exptime_s) if ff_stats.median is not None else None
                 ff_madstd_adu_s = _safe_float(ff_stats.madstd / exptime_s) if ff_stats.madstd is not None else None
@@ -298,16 +248,14 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 roi_median_adu_s = None
                 roi_madstd_adu_s = None
 
-            # Count read/written (non-null) values
-            fields: Dict[str, Any] = {
-                # audit
+            fields = {
                 "exptime_s": exptime_s,
                 "roi_fraction": roi_fraction,
                 "nan_fraction": nan_fraction,
                 "inf_fraction": inf_fraction,
                 "clipped_fraction_ff": ff_stats.clipped_fraction,
                 "clipped_fraction_roi": roi_stats.clipped_fraction,
-                # ff
+
                 "ff_mean_adu": ff_stats.mean,
                 "ff_median_adu": ff_stats.median,
                 "ff_mode_adu": ff_stats.mode,
@@ -329,7 +277,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 "ff_iqr_adu": ff_stats.iqr,
                 "ff_median_adu_s": ff_median_adu_s,
                 "ff_madstd_adu_s": ff_madstd_adu_s,
-                # roi
+
                 "roi_mean_adu": roi_stats.mean,
                 "roi_median_adu": roi_stats.median,
                 "roi_mode_adu": roi_stats.mode,
@@ -354,7 +302,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             }
 
             expected_fields = len(fields)
-            read_fields = expected_fields  # all computed from image; exptime may be None but still "computed/queried"
+            # “read” here means: we attempted/produced all these values; some can still be None legitimately
+            read_fields = expected_fields
             written_fields = sum(1 for v in fields.values() if v is not None)
 
             db.execute(
@@ -396,7 +345,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 (
                     image_id,
                     expected_fields, read_fields, written_fields,
-                    exptime_s, roi_fraction, None, utc_now(),
+                    fields["exptime_s"], fields["roi_fraction"], None, utc_now(),
                     fields["ff_mean_adu"], fields["ff_median_adu"], fields["ff_mode_adu"], fields["ff_sc_mean_adu"], fields["ff_sc_median_adu"],
                     fields["ff_p10_adu"], fields["ff_p25_adu"], fields["ff_p50_adu"], fields["ff_p75_adu"], fields["ff_p90_adu"], fields["ff_p99_adu"], fields["ff_p999_adu"],
                     fields["ff_min_adu"], fields["ff_max_adu"],
@@ -407,27 +356,12 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     fields["roi_min_adu"], fields["roi_max_adu"],
                     fields["roi_std_adu"], fields["roi_sc_std_adu"], fields["roi_mad_adu"], fields["roi_madstd_adu"], fields["roi_iqr_adu"],
                     fields["roi_median_adu_s"], fields["roi_madstd_adu_s"],
-                    nan_fraction, inf_fraction,
+                    fields["nan_fraction"], fields["inf_fraction"],
                     fields["clipped_fraction_ff"], fields["clipped_fraction_roi"],
                 ),
             )
 
-            ended_utc = utc_now()
-            duration_ms = int((time.monotonic() - t0) * 1000)
-            _insert_module_run(
-                db,
-                image_id,
-                expected_read=expected_fields,
-                read=read_fields,
-                written=written_fields,
-                status="ok",
-                message=None,
-                started_utc=started_utc,
-                ended_utc=ended_utc,
-                duration_ms=duration_ms,
-            )
-
-        # Logging
+        # Logging stays the same style
         duration_s = time.monotonic() - t0
         logger.log_module_result(
             module=MODULE_NAME,
@@ -441,7 +375,16 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             verbose_fields=fields,
         )
 
-        return None
+        # Tell pipeline to write module_runs centrally (duration_us measured in pipeline)
+        return ModuleRunRecord(
+            image_id=int(image_id),
+            expected_read=int(expected_fields),
+            read=int(read_fields),
+            expected_written=0,  # IMPORTANT: pipeline currently sums expected_read + expected_written
+            written=int(written_fields),
+            status="OK",
+            message=None,
+        )
 
     except Exception as e:
         duration_s = time.monotonic() - t0
@@ -452,5 +395,17 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             reason=f"{type(e).__name__}:{e}",
             duration_s=duration_s,
         )
-        return False
 
+        # If we managed to obtain image_id before failing, return a record so pipeline can audit it.
+        if image_id is not None:
+            return ModuleRunRecord(
+                image_id=int(image_id),
+                expected_read=int(expected_fields),
+                read=int(read_fields),
+                expected_written=0,
+                written=int(written_fields),
+                status="FAILED",
+                message=f"{type(e).__name__}:{e}",
+            )
+
+        return False

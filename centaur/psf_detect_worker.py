@@ -15,6 +15,9 @@ from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
 
+# NEW: structured return so pipeline writes module_runs centrally (with duration_us)
+from centaur.pipeline import ModuleRunRecord
+
 MODULE_NAME = "psf_detect_worker"
 
 
@@ -276,45 +279,6 @@ def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
     return int(row["image_id"]) if row else None
 
 
-def _insert_module_run(
-    db: Database,
-    image_id: int,
-    *,
-    expected_read: int,
-    read: int,
-    written: int,
-    status: str,
-    message: Optional[str],
-    started_utc: str,
-    ended_utc: str,
-    duration_ms: int,
-    duration_us: int,
-) -> None:
-    db.execute(
-        """
-        INSERT INTO module_runs
-        (image_id, module_name, expected_fields, read_fields, written_fields,
-         status, message, started_utc, ended_utc, duration_ms, duration_us, db_written_utc)
-        VALUES (?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            image_id,
-            MODULE_NAME,
-            expected_read,
-            read,
-            written,
-            status,
-            message,
-            started_utc,
-            ended_utc,
-            duration_ms,
-            duration_us,
-            utc_now(),
-        ),
-    )
-
-
 def _maybe_dump_candidates_csv(cfg: AppConfig, image_id: int, file_path: Path, candidates: List[Candidate]) -> None:
     if not getattr(cfg, "psf_debug_dump_candidates_csv", False):
         return
@@ -330,9 +294,8 @@ def _maybe_dump_candidates_csv(cfg: AppConfig, image_id: int, file_path: Path, c
             w.writerow([c.x, c.y, f"{c.value:.3f}", int(c.saturated), int(c.edge_rejected), int(c.rejected), c.reject_reason])
 
 
-def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Optional[bool]:
+def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Any:
     t0 = time.monotonic()
-    started_utc = utc_now()
 
     use_roi = getattr(cfg, "psf_use_roi", True)
     roi_fraction = float(getattr(cfg, "psf_roi_fraction", 0.5)) if use_roi else 1.0
@@ -345,6 +308,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
     peak_window = 3  # currently fixed (3x3)
 
     expected_fields = 0
+    image_id: Optional[int] = None
 
     try:
         with fits.open(str(event.file_path), memmap=False) as hdul:
@@ -500,24 +464,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 ),
             )
 
-            ended_utc = utc_now()
-            duration_us = int((time.monotonic() - t0) * 1_000_000)
-            duration_ms = int(duration_us // 1000)
-
-            _insert_module_run(
-                db,
-                image_id,
-                expected_read=expected_fields,
-                read=read_fields,
-                written=written_fields,
-                status="ok",
-                message=None,
-                started_utc=started_utc,
-                ended_utc=ended_utc,
-                duration_ms=duration_ms,
-                duration_us=duration_us,
-            )
-
             _maybe_dump_candidates_csv(cfg, image_id, event.file_path, candidates)
 
         duration_s = time.monotonic() - t0
@@ -533,7 +479,15 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             verbose_fields=fields,
         )
 
-        return None
+        return ModuleRunRecord(
+            image_id=int(image_id),
+            expected_read=expected_fields,
+            read=read_fields,
+            expected_written=expected_fields,
+            written=written_fields,
+            status="OK",
+            message=None,
+        )
 
     except Exception as e:
         duration_s = time.monotonic() - t0
@@ -544,4 +498,16 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             reason=f"{type(e).__name__}:{e}",
             duration_s=duration_s,
         )
+
+        if image_id is not None:
+            return ModuleRunRecord(
+                image_id=int(image_id),
+                expected_read=int(expected_fields) if expected_fields else 0,
+                read=0,
+                expected_written=int(expected_fields) if expected_fields else 0,
+                written=0,
+                status="FAILED",
+                message=f"{type(e).__name__}:{e}",
+            )
+
         return False

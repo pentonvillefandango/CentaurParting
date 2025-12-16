@@ -8,6 +8,8 @@ from centaur.init_db import init_db
 from centaur.logging import Logger
 from centaur.watcher import Watcher
 from centaur.pipeline import build_worker_registry, run_pipeline_for_event
+from centaur.database import Database, DbConfig
+
 from centaur.schema_sky_basic import ensure_sky_basic_schema
 from centaur.schema_sky_background2d import ensure_sky_background2d_schema
 from centaur.schema_camera_constants import ensure_camera_constants_schema
@@ -21,10 +23,7 @@ from centaur.schema_psf_detect import ensure_psf_detect_schema
 from centaur.schema_psf_basic import ensure_psf_basic_schema
 from centaur.schema_psf_model import ensure_psf_model_schema
 from centaur.schema_psf_grid import ensure_psf_grid_schema
-from centaur.schema_psf_grid import ensure_psf_grid_schema
 from centaur.ensure_migrations import ensure_migrations
-
-
 
 
 def main() -> None:
@@ -48,19 +47,16 @@ def main() -> None:
     ensure_psf_basic_schema(cfg.db_path)
     ensure_psf_model_schema(cfg.db_path)
     ensure_psf_grid_schema(cfg.db_path)
-    ensure_psf_grid_schema(cfg.db_path)
     ensure_migrations(cfg.db_path)
-
-
-
-
-
-
 
     watcher = Watcher(cfg, logger)
     watcher.start()
 
     registry = build_worker_registry()
+
+    # IMPORTANT: pipeline-owned module_runs writer must point at cfg.db_path (not DEFAULT_DB_PATH)
+    db = Database(DbConfig(db_path=cfg.db_path))
+    db.connect()
 
     ready_total = 0
     modules_enabled_total = 0
@@ -81,7 +77,7 @@ def main() -> None:
 
             ready_total += 1
 
-            per_event = run_pipeline_for_event(cfg, logger, event, registry)
+            per_event = run_pipeline_for_event(cfg, logger, event, registry, db=db)
             modules_enabled_total += per_event.enabled
             modules_skipped_total += per_event.skipped
             modules_ok_total += per_event.ok
@@ -105,6 +101,8 @@ def main() -> None:
 
     finally:
         watcher.stop()
+        db.close()
+
         print(
             f"\nFINAL TOTALS: "
             f"ready={ready_total} "

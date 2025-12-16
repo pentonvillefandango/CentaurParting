@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Tuple, List
+from typing import Any, Callable, Dict, Optional, Tuple, List, Union
 
 from centaur.config import AppConfig
-from centaur.logging import Logger
+from centaur.logging import Logger, utc_now
 from centaur.watcher import FileReadyEvent
+from centaur.database import Database
 
 # Workers may accept (cfg, logger, event) OR (cfg, logger, event, ctx)
-WorkerFn = Callable[..., Optional[bool]]
+WorkerFn = Callable[..., Any]
 
 
 @dataclass
@@ -28,6 +30,27 @@ class PipelineContext:
     without storing per-star rows in the DB.
     """
     psf1: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class ModuleRunRecord:
+    """
+    What a worker returns so the pipeline can write module_runs centrally.
+
+    IMPORTANT:
+    - If a worker returns this, it MUST NOT write into module_runs itself.
+    - Worker still writes its own metric tables as usual.
+    """
+    image_id: int
+    expected_read: int
+    read: int
+    expected_written: int
+    written: int
+    status: str  # "OK" / "FAILED" / "SKIPPED"
+    message: Optional[str] = None
+
+
+WorkerReturn = Union[None, bool, ModuleRunRecord]
 
 
 def build_worker_registry() -> Dict[str, WorkerFn]:
@@ -64,9 +87,66 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
         # PSF layer
         "psf_detect_worker": psf_detect_process,
         "psf_basic_worker": psf_basic_process,
-        "psf_grid_worker": psf_grid_process,   # <-- NEW (consumes PSF-1 context)
+        "psf_grid_worker": psf_grid_process,
         "psf_model_worker": psf_model_process,
     }
+
+
+def _insert_module_run(
+    db: Database,
+    *,
+    image_id: int,
+    module_name: str,
+    expected_fields: int,
+    read_fields: int,
+    written_fields: int,
+    status: str,
+    message: Optional[str],
+    started_utc: str,
+    ended_utc: str,
+    duration_us: int,
+) -> None:
+    """
+    Centralized insert into module_runs.
+
+    duration_us is the source of truth.
+    duration_ms is derived for compatibility while both columns exist.
+    """
+    duration_us_i = int(max(0, int(duration_us)))
+    duration_ms = int(duration_us_i // 1000)
+
+    db.execute(
+        """
+        INSERT INTO module_runs (
+            image_id,
+            module_name,
+            expected_fields,
+            read_fields,
+            written_fields,
+            status,
+            message,
+            started_utc,
+            ended_utc,
+            duration_ms,
+            duration_us,
+            db_written_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(image_id),
+            str(module_name),
+            int(expected_fields),
+            int(read_fields),
+            int(written_fields),
+            str(status),
+            message,
+            started_utc,
+            ended_utc,
+            int(duration_ms),
+            int(duration_us_i),
+            utc_now(),
+        ),
+    )
 
 
 def _run_one(
@@ -77,10 +157,8 @@ def _run_one(
     result: PipelineResult,
     ctx: PipelineContext,
     module_name: str,
+    db: Database,
 ) -> None:
-    """
-    Run a single worker and update totals.
-    """
     worker_fn = registry[module_name]
 
     if not cfg.is_module_enabled(module_name):
@@ -89,17 +167,63 @@ def _run_one(
 
     result.enabled += 1
 
-    # Prefer calling with ctx; fall back for older workers that only take 3 args.
-    try:
-        worker_result = worker_fn(cfg, logger, event, ctx)
-    except TypeError:
-        worker_result = worker_fn(cfg, logger, event)
+    started_utc = utc_now()
+    start_ns = time.perf_counter_ns()
 
-    if worker_result is False:
-        result.failed += 1
-        result.failed_items.append((module_name, str(event.file_path)))
-    else:
-        result.ok += 1
+    worker_ret: WorkerReturn
+    try:
+        # Prefer calling with ctx; fall back for older workers that only take 3 args.
+        try:
+            worker_ret = worker_fn(cfg, logger, event, ctx)
+        except TypeError:
+            worker_ret = worker_fn(cfg, logger, event)
+    except Exception as e:
+        worker_ret = False
+        logger.log_failure(module_name, str(event.file_path), action="continue", reason=repr(e))
+
+    end_ns = time.perf_counter_ns()
+    ended_utc = utc_now()
+    duration_us = max(0, (end_ns - start_ns) // 1000)
+
+    # Required path: workers MUST return ModuleRunRecord
+    if isinstance(worker_ret, ModuleRunRecord):
+        # One expected_fields value for DB: choose the larger of the two expectations
+        expected_fields_db = int(max(int(worker_ret.expected_read), int(worker_ret.expected_written)))
+
+        with db.transaction() as tx:
+            _insert_module_run(
+                tx,
+                image_id=int(worker_ret.image_id),
+                module_name=module_name,
+                expected_fields=expected_fields_db,
+                read_fields=int(worker_ret.read),
+                written_fields=int(worker_ret.written),
+                status=str(worker_ret.status),
+                message=worker_ret.message,
+                started_utc=started_utc,
+                ended_utc=ended_utc,
+                duration_us=int(duration_us),
+            )
+
+        s = str(worker_ret.status).upper()
+        if s == "FAILED":
+            result.failed += 1
+            result.failed_items.append((module_name, str(event.file_path)))
+        elif s == "SKIPPED":
+            result.skipped += 1
+        else:
+            result.ok += 1
+        return
+
+    # If any worker still returns old types, treat as FAILED (migration incomplete)
+    result.failed += 1
+    result.failed_items.append((module_name, str(event.file_path)))
+    logger.log_failure(
+        module=module_name,
+        file=str(event.file_path),
+        action="continue",
+        reason="worker_did_not_return_ModuleRunRecord (migration_incomplete)",
+    )
 
 
 def run_pipeline_for_event(
@@ -107,23 +231,20 @@ def run_pipeline_for_event(
     logger: Logger,
     event: FileReadyEvent,
     registry: Dict[str, WorkerFn],
+    db: Database,
 ) -> PipelineResult:
     """
-    Route events through the correct pipeline.
+    Pipeline owns module_runs (duration_us).
 
-    Rule (v1):
-    - Always run fits_header_worker first.
-    - If IMAGETYP == FLAT: run flat_group_worker + flat_basic_worker.
-    - If IMAGETYP == LIGHT (or anything else): run sky_basic_worker, sky_background2d_worker, exposure_advice_worker,
-      and PSF modules.
+    Requirement to be “finished”:
+    - All workers return ModuleRunRecord.
+    - No worker writes to module_runs directly.
     """
     result = PipelineResult()
     ctx = PipelineContext()
 
     # 1) Always run FITS header first
-    _run_one(cfg, logger, event, registry, result, ctx, "fits_header_worker")
-
-    # If header ingest failed, stop here.
+    _run_one(cfg, logger, event, registry, result, ctx, "fits_header_worker", db)
     if result.failed > 0:
         return result
 
@@ -131,7 +252,6 @@ def run_pipeline_for_event(
     imagetyp = ""
     try:
         from astropy.io import fits
-        # Use memmap=False to avoid BZERO/BSCALE issues across platforms
         with fits.open(str(event.file_path), memmap=False) as hdul:
             imagetyp = str(hdul[0].header.get("IMAGETYP", "")).strip().upper()
     except Exception:
@@ -139,10 +259,9 @@ def run_pipeline_for_event(
 
     # 3) Route
     if imagetyp == "FLAT":
-        _run_one(cfg, logger, event, registry, result, ctx, "flat_group_worker")
-        _run_one(cfg, logger, event, registry, result, ctx, "flat_basic_worker")
+        _run_one(cfg, logger, event, registry, result, ctx, "flat_group_worker", db)
+        _run_one(cfg, logger, event, registry, result, ctx, "flat_basic_worker", db)
 
-        # Light-only modules not applicable for flats
         for name in (
             "sky_basic_worker",
             "sky_background2d_worker",
@@ -154,11 +273,8 @@ def run_pipeline_for_event(
         ):
             if cfg.is_module_enabled(name):
                 result.skipped += 1
-
         return result
 
-    # Non-FLAT frames (LIGHT, DARK, BIAS, unknown): run sky + advice + PSF
-    # Flat modules not applicable here
     for name in ("flat_group_worker", "flat_basic_worker"):
         if cfg.is_module_enabled(name):
             result.skipped += 1
@@ -172,6 +288,6 @@ def run_pipeline_for_event(
         "psf_grid_worker",
         "psf_model_worker",
     ):
-        _run_one(cfg, logger, event, registry, result, ctx, name)
+        _run_one(cfg, logger, event, registry, result, ctx, name, db)
 
     return result
