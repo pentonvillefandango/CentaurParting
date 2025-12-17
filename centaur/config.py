@@ -71,6 +71,7 @@ class AppConfig:
             "psf_model_worker": True,
             # - Nebula Mask
             "nebula_mask_worker": True,
+            "masked_signal_worker": True,
         }
     )
 
@@ -139,6 +140,7 @@ def default_config() -> AppConfig:
                 "signal_structure_worker": True,
                 # Nebula_mask
                 "nebula_mask_worker": True,
+                "masked_signal_worker": True,
             },
         ),
     )

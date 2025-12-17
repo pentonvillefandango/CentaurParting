@@ -80,6 +80,7 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
         process_file_event as signal_structure_process,
     )
     from centaur.nebula_mask_worker import process_file_event as nebula_mask_process
+    from centaur.masked_signal_worker import process_file_event as masked_signal_process
 
     return {
         # Must run first so image_id exists and header tables are populated.
@@ -104,6 +105,7 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
         "psf_model_worker": psf_model_process,
         # Nebula mask layer
         "nebula_mask_worker": nebula_mask_process,
+        "masked_signal_worker": masked_signal_process,
     }
 
 
@@ -294,6 +296,7 @@ def run_pipeline_for_event(
             "psf_basic_worker",
             "psf_grid_worker",
             "psf_model_worker",
+            "masked_signal_worker",
         ):
             if cfg.is_module_enabled(name):
                 result.skipped += 1
@@ -315,6 +318,7 @@ def run_pipeline_for_event(
         "psf_basic_worker",
         "psf_grid_worker",
         "psf_model_worker",
+        "masked_signal_worker",
     ):
         _run_one(cfg, logger, event, registry, result, ctx, name, db)
 
