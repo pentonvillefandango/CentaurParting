@@ -19,7 +19,9 @@ class PipelineResult:
     skipped: int = 0
     ok: int = 0
     failed: int = 0
-    failed_items: List[Tuple[str, str]] = field(default_factory=list)  # (module_name, file_path)
+    failed_items: List[Tuple[str, str]] = field(
+        default_factory=list
+    )  # (module_name, file_path)
 
 
 @dataclass
@@ -29,6 +31,7 @@ class PipelineContext:
     Used to pass runtime-computed per-star data from PSF-1 to downstream workers
     without storing per-star rows in the DB.
     """
+
     psf1: Optional[Dict[str, Any]] = None
 
 
@@ -41,6 +44,7 @@ class ModuleRunRecord:
     - If a worker returns this, it MUST NOT write into module_runs itself.
     - Worker still writes its own metric tables as usual.
     """
+
     image_id: int
     expected_read: int
     read: int
@@ -63,43 +67,43 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
     from centaur.sky_background2d_worker import process_file_event as sky_bkg2d_process
     from centaur.saturation_worker import process_file_event as saturation_process
     from centaur.roi_signal_worker import process_file_event as roi_signal_process
-    from centaur.exposure_advice_worker import process_file_event as exposure_advice_process
+    from centaur.exposure_advice_worker import (
+        process_file_event as exposure_advice_process,
+    )
     from centaur.flat_basic_worker import process_file_event as flat_basic_process
     from centaur.flat_group_worker import process_file_event as flat_group_process
     from centaur.psf_detect_worker import process_file_event as psf_detect_process
     from centaur.psf_basic_worker import process_file_event as psf_basic_process
     from centaur.psf_grid_worker import process_file_event as psf_grid_process
     from centaur.psf_model_worker import process_file_event as psf_model_process
-    from centaur.signal_structure_worker import process_file_event as signal_structure_process
+    from centaur.signal_structure_worker import (
+        process_file_event as signal_structure_process,
+    )
+    from centaur.nebula_mask_worker import process_file_event as nebula_mask_process
 
     return {
         # Must run first so image_id exists and header tables are populated.
         "fits_header_worker": fits_header_process,
-
         # Flats
         "flat_group_worker": flat_group_process,
         "flat_basic_worker": flat_basic_process,
-
         # Sky metrics (LIGHT frames)
         "sky_basic_worker": sky_basic_process,
         "sky_background2d_worker": sky_bkg2d_process,
-        
         # New : signal structure
         "signal_structure_worker": signal_structure_process,
-
         # New: saturation + target ROI signal (LIGHT frames)
         "saturation_worker": saturation_process,
         "roi_signal_worker": roi_signal_process,
-
-
         # Decision layer (Module0) (LIGHT frames)
         "exposure_advice_worker": exposure_advice_process,
-
         # PSF layer
         "psf_detect_worker": psf_detect_process,
         "psf_basic_worker": psf_basic_process,
         "psf_grid_worker": psf_grid_process,
         "psf_model_worker": psf_model_process,
+        # Nebula mask layer
+        "nebula_mask_worker": nebula_mask_process,
     }
 
 
@@ -190,7 +194,9 @@ def _run_one(
             worker_ret = worker_fn(cfg, logger, event)
     except Exception as e:
         worker_ret = False
-        logger.log_failure(module_name, str(event.file_path), action="continue", reason=repr(e))
+        logger.log_failure(
+            module_name, str(event.file_path), action="continue", reason=repr(e)
+        )
 
     end_ns = time.perf_counter_ns()
     ended_utc = utc_now()
@@ -199,7 +205,9 @@ def _run_one(
     # Required path: workers MUST return ModuleRunRecord
     if isinstance(worker_ret, ModuleRunRecord):
         # One expected_fields value for DB: choose the larger of the two expectations
-        expected_fields_db = int(max(int(worker_ret.expected_read), int(worker_ret.expected_written)))
+        expected_fields_db = int(
+            max(int(worker_ret.expected_read), int(worker_ret.expected_written))
+        )
 
         with db.transaction() as tx:
             _insert_module_run(
@@ -263,6 +271,7 @@ def run_pipeline_for_event(
     imagetyp = ""
     try:
         from astropy.io import fits
+
         with fits.open(str(event.file_path), memmap=False) as hdul:
             imagetyp = str(hdul[0].header.get("IMAGETYP", "")).strip().upper()
     except Exception:
@@ -276,6 +285,7 @@ def run_pipeline_for_event(
         for name in (
             "sky_basic_worker",
             "sky_background2d_worker",
+            "nebula_mask_worker",
             "signal_structure_worker",
             "saturation_worker",
             "roi_signal_worker",
@@ -296,6 +306,7 @@ def run_pipeline_for_event(
     for name in (
         "sky_basic_worker",
         "sky_background2d_worker",
+        "nebula_mask_worker",
         "saturation_worker",
         "signal_structure_worker",
         "roi_signal_worker",

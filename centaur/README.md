@@ -1,6 +1,6 @@
 # Centaur Parting
 
-Centaur Parting is a real-time astrophotography FITS ingestion and diagnostics pipeline.
+CENTAUR PARTING IS A REAL-TIME ASTROPHOTOGRAPHY FITS INGESTION AND DIAGNOSTICS PIPELINE.
 
 It watches one or more folders for newly written FITS files, waits until each file is stable, then runs a deterministic, modular analysis pipeline that writes **one row per image per module** into a SQLite database.
 

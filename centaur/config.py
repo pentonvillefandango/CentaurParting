@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal
 
 from centaur.init_db import DEFAULT_DB_PATH
 from centaur.logging import LoggingConfig
@@ -17,6 +17,7 @@ class WatchRoot:
     A folder Centaur Parting watches for new FITS files.
     root_label is a friendly name for GUI/logging later.
     """
+
     root_path: Path
     root_label: str
 
@@ -50,30 +51,26 @@ class AppConfig:
     enabled_modules: Dict[str, bool] = field(
         default_factory=lambda: {
             "fits_header_worker": True,
-
             # Sky
             "sky_basic_worker": True,
             "sky_background2d_worker": True,
-
             # Structure
             "signal_structure_worker": True,
-        
             # New: saturation + ROI signal
             "saturation_worker": True,
             "roi_signal_worker": True,
-
             # Advice
             "exposure_advice_worker": True,
-
             # Flats
             "flat_basic_worker": True,
             "flat_group_worker": True,
-
             # PSF
             "psf_detect_worker": True,
             "psf_basic_worker": True,
             "psf_grid_worker": True,
             "psf_model_worker": True,
+            # - Nebula Mask
+            "nebula_mask_worker": True,
         }
     )
 
@@ -98,6 +95,11 @@ class AppConfig:
     psf2_fit_radius_px: int = 8
     psf2_models: list[str] = field(default_factory=lambda: ["gaussian", "moffat"])
     psf2_min_good_fits = 50
+    # Nebula mask (Phase next: target-aware signal)
+    nebula_mask_threshold_sigma: float = 3.0
+    nebula_mask_smooth_sigma_px: float = 2.0
+    nebula_mask_bg_clip_sigma: float = 3.0
+    nebula_mask_bg_clip_maxiters: int = 5
 
     def is_module_enabled(self, module_name: str) -> bool:
         return self.enabled_modules.get(module_name, False)
@@ -110,7 +112,9 @@ def default_config() -> AppConfig:
     """
     return AppConfig(
         watch_roots=[
-            WatchRoot(Path("/Users/admin/Documents/Windowsshared/Astro_Data/Rig24"), "Rig24")
+            WatchRoot(
+                Path("/Users/admin/Documents/Windowsshared/Astro_Data/Rig24"), "Rig24"
+            )
             # Example (edit this)
             # WatchRoot(Path("/Volumes/NAS/rig1/captures"), "Rig1 NAS"),
         ],
@@ -118,26 +122,23 @@ def default_config() -> AppConfig:
             enabled=True,
             module_verbosity={
                 "fits_header_worker": False,
-
                 # Sky
                 "sky_basic_worker": False,
                 "sky_background2d_worker": False,
-
                 # New
                 "saturation_worker": False,
                 "roi_signal_worker": False,
-
                 # Advice
                 "exposure_advice_worker": False,
-
                 # PSF
                 "psf_detect_worker": False,
                 "psf_basic_worker": False,
                 "psf_model_worker": False,
                 "psf_grid_worker": False,
-
-                # structure 
+                # structure
                 "signal_structure_worker": True,
+                # Nebula_mask
+                "nebula_mask_worker": True,
             },
         ),
     )
