@@ -72,14 +72,12 @@ class AppConfig:
             # - Nebula Mask
             "nebula_mask_worker": True,
             "masked_signal_worker": True,
+            "star_headroom_worker": True,
         }
     )
 
-    # ROI signal worker (deterministic defaults; can be tuned later)
     roi_signal_obj_fraction: float = 0.20
     roi_signal_bg_outer_fraction: float = 0.45
-
-    # PSF (Phase 3, PSF-0 Detect)
     psf_use_roi: bool = False
     psf_roi_fraction: float = 0.5
     psf_threshold_sigma: float = 8.0
@@ -96,11 +94,13 @@ class AppConfig:
     psf2_fit_radius_px: int = 8
     psf2_models: list[str] = field(default_factory=lambda: ["gaussian", "moffat"])
     psf2_min_good_fits = 50
-    # Nebula mask (Phase next: target-aware signal)
     nebula_mask_threshold_sigma: float = 3.0
     nebula_mask_smooth_sigma_px: float = 2.0
     nebula_mask_bg_clip_sigma: float = 3.0
     nebula_mask_bg_clip_maxiters: int = 5
+    star_headroom_max_stars: int = 0
+    star_headroom_sample_radius_px: int = 3
+    star_headroom_peak_percentile: float = 99
 
     def is_module_enabled(self, module_name: str) -> bool:
         return self.enabled_modules.get(module_name, False)
@@ -123,24 +123,19 @@ def default_config() -> AppConfig:
             enabled=True,
             module_verbosity={
                 "fits_header_worker": False,
-                # Sky
                 "sky_basic_worker": False,
                 "sky_background2d_worker": False,
-                # New
                 "saturation_worker": False,
                 "roi_signal_worker": False,
-                # Advice
                 "exposure_advice_worker": False,
-                # PSF
                 "psf_detect_worker": False,
                 "psf_basic_worker": False,
                 "psf_model_worker": False,
                 "psf_grid_worker": False,
-                # structure
-                "signal_structure_worker": True,
-                # Nebula_mask
-                "nebula_mask_worker": True,
-                "masked_signal_worker": True,
+                "signal_structure_worker": False,
+                "nebula_mask_worker": False,
+                "masked_signal_worker": False,
+                "star_headroom_worker": True,
             },
         ),
     )
