@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from centaur.model_tests.common import (
+    TestResult,
+    connect,
+    sample_light_image_ids,
+    basic_table_health_check,
+    ok,
+    fail,
+    write_result,
+)
+
+
+def make_generic_test(table_name: str):
+    def _test(db_path: Path, out_path: Path) -> TestResult:
+        conn = connect(db_path)
+
+        light_ids = sample_light_image_ids(conn, limit=2000)
+        if not light_ids:
+            res = fail(table_name, "no_light_frames_found")
+            write_result(out_path, res)
+            return res
+
+        passed, details = basic_table_health_check(conn, table_name, light_ids, coverage_min=0.80)
+
+        if passed:
+            res = ok(table_name, "ok", **details)
+        else:
+            summary = details.get("error", "failed")
+            res = fail(table_name, summary, **details)
+
+        write_result(out_path, res)
+        return res
+
+    return _test

@@ -38,8 +38,6 @@ def main() -> None:
 
     # Base schema (safe to run repeatedly)
     init_db(cfg.db_path)
-
-    # Schema add-ons (safe to run repeatedly)
     ensure_sky_basic_schema(cfg.db_path)
     ensure_sky_background2d_schema(cfg.db_path)
     ensure_camera_constants_schema(cfg.db_path)
@@ -54,14 +52,11 @@ def main() -> None:
     ensure_psf_model_schema(cfg.db_path)
     ensure_psf_grid_schema(cfg.db_path)
     ensure_nebula_mask_schema(cfg.db_path)
-
-    # NEW
     ensure_saturation_schema(cfg.db_path)
     ensure_roi_signal_schema(cfg.db_path)
     ensure_signal_structure_schema(cfg.db_path)
     ensure_masked_signal_schema(cfg.db_path)
     ensure_star_headroom_schema(cfg.db_path)
-
     ensure_migrations(cfg.db_path)
 
     watcher = Watcher(cfg, logger)

@@ -25,7 +25,7 @@ class WatchRoot:
 @dataclass
 class AppConfig:
     """
-    Central configuration for Centaur Parting (v1).
+    Central configuration for CentaurParting (v1).
     In v1, this will be code-defined. Later it can be GUI-driven.
     """
 
