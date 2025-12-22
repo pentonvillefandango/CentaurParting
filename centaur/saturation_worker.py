@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import time
@@ -62,14 +61,75 @@ def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
     return int(row["image_id"]) if row else None
 
 
-def _get_header_fields(db: Database, image_id: int) -> Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]:
+def _derive_saturation_adu_from_fits_encoding(
+    *,
+    bitpix: Optional[int],
+    bzero: Optional[float],
+    bscale: Optional[float],
+) -> Optional[float]:
+    """
+    Derive an ADU ceiling from FITS storage encoding.
+
+    Uses FITS scaling: physical = raw * BSCALE + BZERO.
+
+    For the common NINA/QHY case:
+      BITPIX=16, BZERO=32768, BSCALE=1 => ceiling = 32767 + 32768 = 65535
+    """
+    if bitpix is None:
+        return None
+
+    bz = 0.0 if bzero is None else float(bzero)
+    bs = 1.0 if bscale is None else float(bscale)
+
+    if not np.isfinite(bz) or not np.isfinite(bs) or bs == 0.0:
+        return None
+
+    # Most common integer cases
+    if bitpix == 16:
+        raw_max = 32767.0  # signed int16
+    elif bitpix == 8:
+        raw_max = 255.0  # unsigned byte in FITS
+    elif bitpix == 32:
+        raw_max = 2147483647.0  # signed int32
+    else:
+        # BITPIX < 0 => float storage; ceiling not derivable generically
+        return None
+
+    ceiling = raw_max * bs + bz
+    if not np.isfinite(ceiling) or ceiling <= 0:
+        return None
+    return float(ceiling)
+
+
+def _get_header_fields(db: Database, image_id: int) -> Tuple[
+    Optional[float],
+    Optional[float],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[float],
+    Optional[float],
+]:
     row = db.execute(
-        "SELECT exptime, datamax, naxis1, naxis2 FROM fits_header_core WHERE image_id = ?",
+        """
+        SELECT exptime, datamax, naxis1, naxis2, bitpix, bzero, bscale
+        FROM fits_header_core
+        WHERE image_id = ?
+        """,
         (image_id,),
     ).fetchone()
     if not row:
-        return None, None, None, None
-    return _safe_float(row["exptime"]), _safe_float(row["datamax"]), row["naxis1"], row["naxis2"]
+        return None, None, None, None, None, None, None
+
+    exptime_s = _safe_float(row["exptime"])
+    datamax_adu = _safe_float(row["datamax"])
+    naxis1 = row["naxis1"]
+    naxis2 = row["naxis2"]
+    bitpix = row["bitpix"]
+    bzero = _safe_float(row["bzero"])
+    bscale = _safe_float(row["bscale"])
+
+    return exptime_s, datamax_adu, naxis1, naxis2, bitpix, bzero, bscale
 
 
 def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Any:
@@ -102,17 +162,30 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             if image_id is None:
                 raise RuntimeError("image_id_not_found_for_file_path")
 
-            exptime_s, datamax_adu, naxis1, naxis2 = _get_header_fields(db, int(image_id))
+            exptime_s, datamax_adu, naxis1, naxis2, bitpix, bzero, bscale = (
+                _get_header_fields(db, int(image_id))
+            )
 
-            saturation_adu = datamax_adu  # may be None
+            parse_warnings: Optional[str] = None
+
+            saturation_adu = datamax_adu
+            if saturation_adu is None:
+                saturation_adu = _derive_saturation_adu_from_fits_encoding(
+                    bitpix=bitpix, bzero=bzero, bscale=bscale
+                )
+                if saturation_adu is not None:
+                    parse_warnings = "derived_saturation_adu_from_fits_encoding"
 
             if saturation_adu is not None:
-                sat_mask = (np.isfinite(arr2d)) & (arr2d >= saturation_adu)
+                sat_mask = (np.isfinite(arr2d)) & (arr2d >= float(saturation_adu))
                 saturated_pixel_count = int(sat_mask.sum())
             else:
                 # Fallback: count pixels at the max value (weaker but deterministic)
                 sat_mask = (np.isfinite(arr2d)) & (arr2d >= max_pixel_adu)
                 saturated_pixel_count = int(sat_mask.sum())
+                parse_warnings = (
+                    parse_warnings + ";" if parse_warnings else ""
+                ) + "no_saturation_adu_ceiling"
 
             if naxis1 and naxis2:
                 total_px = int(naxis1) * int(naxis2)
@@ -123,9 +196,13 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             saturated_pixel_fraction = float(saturated_pixel_count) / float(total_px)
 
             if saturation_adu is not None:
-                below = finite[finite < saturation_adu]
+                below = finite[finite < float(saturation_adu)]
                 brightest_star_peak_adu = float(np.max(below)) if below.size else None
-                headroom_fraction = _safe_float(1.0 - (brightest_star_peak_adu / saturation_adu)) if brightest_star_peak_adu is not None else None
+                headroom_fraction = (
+                    _safe_float(1.0 - (brightest_star_peak_adu / float(saturation_adu)))
+                    if brightest_star_peak_adu is not None
+                    else None
+                )
             else:
                 brightest_star_peak_adu = None
                 headroom_fraction = None
@@ -170,12 +247,21 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 """,
                 (
                     int(image_id),
-                    int(expected_fields), int(read_fields), int(written_fields),
-                    fields["exptime_s"], None, utc_now(),
-                    fields["saturation_adu"], fields["max_pixel_adu"], fields["saturated_pixel_count"], fields["saturated_pixel_fraction"],
+                    int(expected_fields),
+                    int(read_fields),
+                    int(written_fields),
+                    fields["exptime_s"],
+                    parse_warnings,
+                    utc_now(),
+                    fields["saturation_adu"],
+                    fields["max_pixel_adu"],
+                    fields["saturated_pixel_count"],
+                    fields["saturated_pixel_fraction"],
                     fields["brightest_star_peak_adu"],
-                    fields["nan_fraction"], fields["inf_fraction"],
-                    fields["usable"], fields["reason"],
+                    fields["nan_fraction"],
+                    fields["inf_fraction"],
+                    fields["usable"],
+                    fields["reason"],
                 ),
             )
 

@@ -13,8 +13,8 @@ from astropy.stats import sigma_clip  # type: ignore
 from centaur.config import AppConfig
 from centaur.database import Database
 from centaur.logging import Logger
-from centaur.watcher import FileReadyEvent
 from centaur.pipeline import ModuleRunRecord
+from centaur.watcher import FileReadyEvent
 
 MODULE_NAME = "nebula_mask_worker"
 
@@ -83,61 +83,88 @@ def _robust_bg_stats(
 def _maybe_gaussian_smooth(arr: np.ndarray, sigma_px: float) -> np.ndarray:
     """
     Optional Gaussian smoothing to stabilize thresholding.
-    Uses scipy.ndimage if available; otherwise returns original array.
+    Requires SciPy (we treat SciPy as a requirement for nebula mask now).
     """
     sigma_px = float(sigma_px)
     if sigma_px <= 0:
         return arr
-    try:
-        from scipy.ndimage import gaussian_filter  # type: ignore
 
-        return gaussian_filter(arr, sigma=sigma_px)
-    except Exception:
-        return arr
+    # SciPy is required; if missing, fail loudly.
+    from scipy.ndimage import gaussian_filter  # type: ignore
+
+    return gaussian_filter(arr, sigma=sigma_px)
+
+
+def _downsample_mask_nn(mask: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Downsample boolean mask by integer factor (nearest-neighbor via slicing).
+    This is only used for connected-components labeling if enabled.
+    """
+    f = int(factor)
+    if f <= 1:
+        return mask
+    # keep top-left samples deterministically
+    return mask[::f, ::f]
 
 
 def _mask_components_stats(
     mask: np.ndarray,
+    *,
+    require_scipy: bool,
+    downsample_factor: int,
 ) -> Tuple[Optional[int], Optional[float], Optional[Dict[str, int]]]:
     """
     Component count + largest component fraction + bbox (of largest component).
-    Uses scipy.ndimage.label if available; otherwise returns (None, None, None).
+
+    - Uses scipy.ndimage.label/find_objects.
+    - If downsample_factor > 1, labeling is done on a downsampled mask, and bbox is scaled back.
+    - largest_component_frac is defined as (largest component pixels) / (total mask pixels)
+      in the SAME domain used for labeling (i.e., downsampled if enabled). This keeps it
+      stable and easy to interpret (largest share of the mask).
     """
     try:
-        from scipy.ndimage import label, find_objects  # type: ignore
+        from scipy.ndimage import find_objects, label  # type: ignore
+    except Exception as e:
+        if require_scipy:
+            raise RuntimeError(f"scipy_required_for_nebula_mask:{type(e).__name__}:{e}")
+        return None, None, None
 
-        lab, n = label(mask.astype(np.uint8))
-        n_i = int(n)
-        if n_i <= 0:
-            return 0, 0.0, None
+    f = max(1, int(downsample_factor))
+    m = _downsample_mask_nn(mask, f) if f > 1 else mask
 
-        # sizes
-        counts = np.bincount(lab.reshape(-1))
-        # counts[0] is background
-        if counts.size <= 1:
-            return n_i, 0.0, None
+    # label connected components
+    lab, n = label(m.astype(np.uint8))
+    n_i = int(n)
+    if n_i <= 0:
+        return 0, 0.0, None
 
-        largest_label = int(np.argmax(counts[1:]) + 1)
-        largest_px = int(counts[largest_label])
-        total_px = int(mask.sum()) if int(mask.sum()) > 0 else 1
-        largest_frac = float(largest_px) / float(total_px)
+    counts = np.bincount(lab.reshape(-1))
+    if counts.size <= 1:
+        return n_i, 0.0, None
 
-        # bbox of largest component
-        sl = find_objects(lab == largest_label)
-        # find_objects on boolean returns list length 1 when called that way; safer: find_objects on labels:
-        sl2 = find_objects(lab)
-        bbox = None
-        if sl2 and len(sl2) >= largest_label and sl2[largest_label - 1] is not None:
-            s = sl2[largest_label - 1]
-            y0 = int(s[0].start)
-            y1 = int(s[0].stop)
-            x0 = int(s[1].start)
-            x1 = int(s[1].stop)
+    largest_label = int(np.argmax(counts[1:]) + 1)
+    largest_px = int(counts[largest_label])
+    total_mask_px = int(m.sum())
+    total_mask_px = max(1, total_mask_px)
+    largest_frac = float(largest_px) / float(total_mask_px)
+
+    # bbox from find_objects on label image
+    sl = find_objects(lab)
+    bbox = None
+    if sl and len(sl) >= largest_label and sl[largest_label - 1] is not None:
+        s = sl[largest_label - 1]
+        y0 = int(s[0].start)
+        y1 = int(s[0].stop)
+        x0 = int(s[1].start)
+        x1 = int(s[1].stop)
+
+        # scale bbox back to original coordinates if downsampled
+        if f > 1:
+            bbox = {"x0": x0 * f, "y0": y0 * f, "x1": x1 * f, "y1": y1 * f}
+        else:
             bbox = {"x0": x0, "y0": y0, "x1": x1, "y1": y1}
 
-        return n_i, _safe_float(largest_frac), bbox
-    except Exception:
-        return None, None, None
+    return n_i, _safe_float(largest_frac), bbox
 
 
 def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
@@ -162,6 +189,10 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
     """
     Build a deterministic nebula/emission mask from the current frame and store aggregate mask metrics.
     One row per image. No per-pixel storage.
+
+    SciPy is treated as a requirement (configurable via cfg.nebula_mask_require_scipy).
+    Downsampling for connected-components is optional via cfg.nebula_mask_components_downsample
+    (default 1 = off).
     """
     t0 = time.monotonic()
 
@@ -176,6 +207,11 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
     smooth_sigma_px = float(getattr(cfg, "nebula_mask_smooth_sigma_px", 2.0))
     clip_sigma = float(getattr(cfg, "nebula_mask_bg_clip_sigma", 3.0))
     clip_maxiters = int(getattr(cfg, "nebula_mask_bg_clip_maxiters", 5))
+
+    require_scipy = bool(getattr(cfg, "nebula_mask_require_scipy", True))
+    downsample_factor = int(getattr(cfg, "nebula_mask_components_downsample", 1))
+    if downsample_factor < 1:
+        downsample_factor = 1
 
     try:
         with fits.open(event.file_path, memmap=False) as hdul:
@@ -197,18 +233,38 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         if threshold_adu is None:
             raise ValueError("threshold_failed")
 
-        # Smooth (optional) then threshold
-        sm = _maybe_gaussian_smooth(arr2d, smooth_sigma_px)
+        # Smooth (optional) then threshold (SciPy required if smoothing enabled)
+        if smooth_sigma_px > 0:
+            try:
+                sm = _maybe_gaussian_smooth(arr2d, smooth_sigma_px)
+            except Exception as e:
+                if require_scipy:
+                    raise
+                # if not required, fall back to unsmoothed
+                logger.log_failure(
+                    module=MODULE_NAME,
+                    file=str(event.file_path),
+                    action=cfg.on_metric_failure,
+                    reason=f"scipy_missing_for_smoothing:{type(e).__name__}:{e}",
+                    duration_s=(time.monotonic() - t0),
+                )
+                sm = arr2d
+        else:
+            sm = arr2d
+
         mask = np.isfinite(sm) & (sm >= threshold_adu)
 
-        # Aggregate mask stats
+        # Aggregate mask stats (full-res)
         total_px = int(arr2d.shape[0]) * int(arr2d.shape[1])
         total_px = max(1, total_px)
         mask_px = int(mask.sum())
         mask_coverage_frac = float(mask_px) / float(total_px)
 
+        # Component stats (optionally downsampled for labeling)
         n_components, largest_component_frac, largest_bbox = _mask_components_stats(
-            mask
+            mask,
+            require_scipy=require_scipy,
+            downsample_factor=downsample_factor,
         )
 
         with Database().transaction() as db:

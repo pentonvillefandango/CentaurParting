@@ -69,15 +69,18 @@ class AppConfig:
             "psf_basic_worker": True,
             "psf_grid_worker": True,
             "psf_model_worker": True,
-            # - Nebula Mask
+            # Nebula / masking chain
             "nebula_mask_worker": True,
             "masked_signal_worker": True,
             "star_headroom_worker": True,
         }
     )
 
+    # ROI signal worker params
     roi_signal_obj_fraction: float = 0.20
     roi_signal_bg_outer_fraction: float = 0.45
+
+    # PSF params
     psf_use_roi: bool = False
     psf_roi_fraction: float = 0.5
     psf_threshold_sigma: float = 8.0
@@ -94,10 +97,23 @@ class AppConfig:
     psf2_fit_radius_px: int = 8
     psf2_models: list[str] = field(default_factory=lambda: ["gaussian", "moffat"])
     psf2_min_good_fits = 50
+
+    # Nebula mask params
     nebula_mask_threshold_sigma: float = 3.0
     nebula_mask_smooth_sigma_px: float = 2.0
     nebula_mask_bg_clip_sigma: float = 3.0
     nebula_mask_bg_clip_maxiters: int = 5
+
+    # NEW: nebula mask component-labeling requirements/options
+    # We are making SciPy a requirement, so the worker should fail if SciPy is missing.
+    nebula_mask_require_scipy: bool = True
+
+    # Optional performance knob: downsample before connected-components labeling.
+    # 1 = off (default), 2 = half-res, 4 = quarter-res, etc.
+    # (leave this at 1 unless you explicitly want it.)
+    nebula_mask_components_downsample: int = 1
+
+    # Star headroom params
     star_headroom_max_stars: int = 0
     star_headroom_sample_radius_px: int = 3
     star_headroom_peak_percentile: float = 99

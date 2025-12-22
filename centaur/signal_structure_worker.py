@@ -1,10 +1,9 @@
-
 from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import numpy as np
 
@@ -46,10 +45,10 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
     Model A: structure-based efficiency metrics for full-frame nebula/small sensors.
 
     Reads inputs from existing metric tables:
-      - sky_basic_metrics: percentiles + ff_madstd_adu_s
-      - sky_background2d_metrics: plane_slope_mag_adu_per_tile_s
+      - sky_basic_metrics: percentiles + ff_madstd_adu_s (required)
+      - sky_background2d_metrics: plane_slope_mag_adu_per_tile_s (optional but preferred)
       - saturation_metrics: saturated_pixel_fraction (optional)
-      - psf_basic_metrics: fwhm/ecc/usable (optional)
+      - psf_basic_metrics: fwhm/ecc/usable (optional, but psf_usable must not be NULL)
 
     Writes one row per image into signal_structure_metrics.
     Pipeline owns module_runs.
@@ -61,6 +60,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
     written_fields = 0
     image_id: Optional[int] = None
     fields: Dict[str, Any] = {}
+    parse_warnings: List[str] = []
 
     try:
         with Database().transaction() as db:
@@ -91,18 +91,43 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             ff_p999 = _safe_float(sb["ff_p999_adu"])
             ff_madstd_s = _safe_float(sb["ff_madstd_adu_s"])
 
-            ff_p90m_p10 = _safe_float(ff_p90 - ff_p10) if (ff_p90 is not None and ff_p10 is not None) else None
-            ff_p99m_p50 = _safe_float(ff_p99 - ff_p50) if (ff_p99 is not None and ff_p50 is not None) else None
-            ff_p999m_p50 = _safe_float(ff_p999 - ff_p50) if (ff_p999 is not None and ff_p50 is not None) else None
+            ff_p90m_p10 = (
+                _safe_float(ff_p90 - ff_p10)
+                if (ff_p90 is not None and ff_p10 is not None)
+                else None
+            )
+            ff_p99m_p50 = (
+                _safe_float(ff_p99 - ff_p50)
+                if (ff_p99 is not None and ff_p50 is not None)
+                else None
+            )
+            ff_p999m_p50 = (
+                _safe_float(ff_p999 - ff_p50)
+                if (ff_p999 is not None and ff_p50 is not None)
+                else None
+            )
 
             if exptime_s is not None and exptime_s > 0:
-                ff_p90m_p10_s = _safe_float(ff_p90m_p10 / exptime_s) if ff_p90m_p10 is not None else None
-                ff_p99m_p50_s = _safe_float(ff_p99m_p50 / exptime_s) if ff_p99m_p50 is not None else None
-                ff_p999m_p50_s = _safe_float(ff_p999m_p50 / exptime_s) if ff_p999m_p50 is not None else None
+                ff_p90m_p10_s = (
+                    _safe_float(ff_p90m_p10 / exptime_s)
+                    if ff_p90m_p10 is not None
+                    else None
+                )
+                ff_p99m_p50_s = (
+                    _safe_float(ff_p99m_p50 / exptime_s)
+                    if ff_p99m_p50 is not None
+                    else None
+                )
+                ff_p999m_p50_s = (
+                    _safe_float(ff_p999m_p50 / exptime_s)
+                    if ff_p999m_p50 is not None
+                    else None
+                )
             else:
                 ff_p90m_p10_s = None
                 ff_p99m_p50_s = None
                 ff_p999m_p50_s = None
+                parse_warnings.append("exptime_missing_or_nonpos")
 
             # --- sky_background2d inputs (optional but strongly preferred) ---
             b2 = db.execute(
@@ -114,6 +139,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 (image_id,),
             ).fetchone()
             grad_s = _safe_float(b2["plane_slope_mag_adu_per_tile_s"]) if b2 else None
+            if b2 is None:
+                parse_warnings.append("missing_sky_background2d_metrics")
 
             # --- saturation inputs (optional) ---
             sat = db.execute(
@@ -125,6 +152,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 (image_id,),
             ).fetchone()
             sat_frac = _safe_float(sat["saturated_pixel_fraction"]) if sat else None
+            if sat is None:
+                parse_warnings.append("missing_saturation_metrics")
 
             # --- PSF inputs (optional) ---
             pb = db.execute(
@@ -135,44 +164,62 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 """,
                 (image_id,),
             ).fetchone()
+
             psf_fwhm = _safe_float(pb["fwhm_px_median"]) if pb else None
             psf_ecc = _safe_float(pb["ecc_median"]) if pb else None
-            psf_usable = int(pb["usable"]) if (pb and pb["usable"] is not None) else None
+
+            # IMPORTANT: psf_usable must NOT be NULL for downstream invariants/tests.
+            # Default to 0 (not usable) if psf_basic row is missing or usable is NULL.
+            psf_usable: int = 0
+            if pb is None:
+                parse_warnings.append("missing_psf_basic_metrics")
+            else:
+                if pb["usable"] is None:
+                    parse_warnings.append("psf_basic_usable_null")
+                else:
+                    try:
+                        psf_usable = 1 if int(pb["usable"]) == 1 else 0
+                    except Exception:
+                        psf_usable = 0
+                        parse_warnings.append("psf_basic_usable_parse_failed")
 
             # --- derived: efficiency + time weight ---
-            # Choose p99-p50 as the primary structure term (as per your validated SQL)
+            # Choose p99-p50 as the primary structure term
             structure = ff_p99m_p50_s  # ADU/s
-            noise = ff_madstd_s        # ADU/s
-            grad = grad_s              # ADU/tile/s (proxy)
+            noise = ff_madstd_s  # ADU/s
+            grad = grad_s  # ADU/tile/s (proxy)
 
             eps = 1e-12
             eff_score: Optional[float] = None
             time_weight: Optional[float] = None
 
             if structure is not None and noise is not None:
-                denom = (noise * noise) + ((grad * grad) if grad is not None else 0.0) + eps
+                denom = (
+                    (noise * noise) + ((grad * grad) if grad is not None else 0.0) + eps
+                )
                 eff_score = _safe_float((structure * structure) / denom)
-                time_weight = _safe_float(1.0 / (eff_score + eps)) if eff_score is not None else None
+                time_weight = (
+                    _safe_float(1.0 / (eff_score + eps))
+                    if eff_score is not None
+                    else None
+                )
+            else:
+                parse_warnings.append("insufficient_inputs_for_eff_score")
 
             fields = {
                 "exptime_s": exptime_s,
-
                 "ff_p90_minus_p10_adu": ff_p90m_p10,
                 "ff_p99_minus_p50_adu": ff_p99m_p50,
                 "ff_p999_minus_p50_adu": ff_p999m_p50,
-
                 "ff_p90_minus_p10_adu_s": ff_p90m_p10_s,
                 "ff_p99_minus_p50_adu_s": ff_p99m_p50_s,
                 "ff_p999_minus_p50_adu_s": ff_p999m_p50_s,
-
                 "ff_madstd_adu_s": ff_madstd_s,
                 "plane_slope_mag_adu_per_tile_s": grad_s,
-
                 "saturated_pixel_fraction": sat_frac,
                 "psf_fwhm_px_median": psf_fwhm,
                 "psf_ecc_median": psf_ecc,
-                "psf_usable": psf_usable,
-
+                "psf_usable": psf_usable,  # <- never NULL now
                 "eff_score": eff_score,
                 "time_weight": time_weight,
             }
@@ -180,6 +227,8 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             expected_fields = len(fields)
             read_fields = expected_fields
             written_fields = sum(1 for v in fields.values() if v is not None)
+
+            pw = ",".join(parse_warnings) if parse_warnings else None
 
             db.execute(
                 """
@@ -219,22 +268,24 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 """,
                 (
                     int(image_id),
-                    int(expected_fields), int(read_fields), int(written_fields),
-                    None, utc_now(),
-
+                    int(expected_fields),
+                    int(read_fields),
+                    int(written_fields),
+                    pw,
+                    utc_now(),
                     fields["exptime_s"],
-
-                    fields["ff_p90_minus_p10_adu"], fields["ff_p99_minus_p50_adu"], fields["ff_p999_minus_p50_adu"],
-                    fields["ff_p90_minus_p10_adu_s"], fields["ff_p99_minus_p50_adu_s"], fields["ff_p999_minus_p50_adu_s"],
-
+                    fields["ff_p90_minus_p10_adu"],
+                    fields["ff_p99_minus_p50_adu"],
+                    fields["ff_p999_minus_p50_adu"],
+                    fields["ff_p90_minus_p10_adu_s"],
+                    fields["ff_p99_minus_p50_adu_s"],
+                    fields["ff_p999_minus_p50_adu_s"],
                     fields["ff_madstd_adu_s"],
                     fields["plane_slope_mag_adu_per_tile_s"],
-
                     fields["saturated_pixel_fraction"],
                     fields["psf_fwhm_px_median"],
                     fields["psf_ecc_median"],
-                    fields["psf_usable"],
-
+                    int(fields["psf_usable"]),
                     fields["eff_score"],
                     fields["time_weight"],
                 ),
@@ -249,7 +300,10 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             written=written_fields,
             status="OK",
             duration_s=time.monotonic() - t0,
-            verbose_fields=fields,
+            verbose_fields={
+                **fields,
+                "parse_warnings": ",".join(parse_warnings) if parse_warnings else None,
+            },
         )
 
         return ModuleRunRecord(

@@ -92,9 +92,7 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
         # Sky metrics (LIGHT frames)
         "sky_basic_worker": sky_basic_process,
         "sky_background2d_worker": sky_bkg2d_process,
-        # New : signal structure
-        "signal_structure_worker": signal_structure_process,
-        # New: saturation + target ROI signal (LIGHT frames)
+        # new: saturation + target roi signal (light frames)
         "saturation_worker": saturation_process,
         "roi_signal_worker": roi_signal_process,
         # Decision layer (Module0) (LIGHT frames)
@@ -104,6 +102,8 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
         "psf_basic_worker": psf_basic_process,
         "psf_grid_worker": psf_grid_process,
         "psf_model_worker": psf_model_process,
+        # New : signal structure
+        "signal_structure_worker": signal_structure_process,
         # Nebula mask layer
         "nebula_mask_worker": nebula_mask_process,
         "masked_signal_worker": masked_signal_process,
@@ -312,18 +312,19 @@ def run_pipeline_for_event(
     for name in (
         "sky_basic_worker",
         "sky_background2d_worker",
-        "nebula_mask_worker",
         "saturation_worker",
-        "signal_structure_worker",
         "roi_signal_worker",
-        "exposure_advice_worker",
         "psf_detect_worker",
         "psf_basic_worker",
-        "star_headroom_worker",
         "psf_grid_worker",
         "psf_model_worker",
+        "signal_structure_worker",
+        "nebula_mask_worker",
         "masked_signal_worker",
+        "star_headroom_worker",
+        "exposure_advice_worker",
     ):
+
         _run_one(cfg, logger, event, registry, result, ctx, name, db)
 
     return result
