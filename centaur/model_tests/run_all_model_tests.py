@@ -7,13 +7,35 @@
 # - Prints PASS/FAIL/ERROR per model
 #
 # Usage:
+#   # Run all model tests (no dependency check)
 #   python3 centaur/model_tests/run_all_model_tests.py --db data/centaurparting.db
-#   python3 centaur/model_tests/run_all_model_tests.py --db data/centaurparting.db --run-dir data/model_tests/test_results_20251220_123000
 #
-# New flags:
-#   -dep   include dependency check (test_model_dependencies)
+#   # Explicit run directory
+#   python3 centaur/model_tests/run_all_model_tests.py --db data/centaurparting.db \
+#       --run-dir data/model_tests/test_results_20251220_123000
+#
+#   # Include dependency check
+#   python3 centaur/model_tests/run_all_model_tests.py --db data/centaurparting.db -dep
+#
+#   # Only show failures (still runs everything)
+#   python3 centaur/model_tests/run_all_model_tests.py --db data/centaurparting.db -of
+#
+#   # Only show failures + dependency check
+#   python3 centaur/model_tests/run_all_model_tests.py --db data/centaurparting.db -of -dep
+#
+#   # If dependency check fails, dump its JSON for troubleshooting
+#   python3 centaur/model_tests/run_all_model_tests.py --db data/centaurparting.db -dep -v
+#   python3 centaur/model_tests/run_all_model_tests.py --db data/centaurparting.db -of -dep -v
+#
+# Flags:
+#   -dep   include dependency check (test_model_dependencies.py)
 #   -of    only show failures (less output; still runs everything)
-#   -v     (only meaningful with -dep) if dependency check fails, print its JSON (useful for troubleshooting)
+#   -v     with -dep: if dependency check FAIL/ERROR, print its JSON (useful for troubleshooting)
+#
+# Notes:
+# - IMPORTANT FIX: we DO NOT forward "--only-failures" to test_model_dependencies.py because it
+#   doesn't accept it (argparse would exit 2 -> ERROR). "-of" is handled by this runner only.
+# - Dependency test currently manages its own output directory and does not accept --run-dir here.
 
 from __future__ import annotations
 
@@ -242,10 +264,15 @@ def main() -> int:
         ("watch_roots", "centaur/model_tests/models/test_watch_roots.py", True),
         ("image_setups", "centaur/model_tests/models/test_image_setups.py", True),
         ("optical_setups", "centaur/model_tests/models/test_optical_setups.py", True),
+        (
+            "frame_quality",
+            "centaur/model_tests/models/test_frame_quality_metrics.py",
+            True,
+        ),
     ]
 
     if args.dep:
-        # Dependency script currently manages its own output directory and may not accept --run-dir.
+        # Dependency script currently expects only "--db" and manages its own output directory.
         tests.append(
             (
                 "model_dependencies",
@@ -257,7 +284,9 @@ def main() -> int:
     print(f"[run_all_model_tests] db={db_path}")
     print(f"[run_all_model_tests] run_dir={run_dir}")
     print(
-        f"[run_all_model_tests] dep={'ON' if args.dep else 'OFF'} only_failures={'ON' if args.only_failures else 'OFF'} verbose={'ON' if args.verbose else 'OFF'}"
+        f"[run_all_model_tests] dep={'ON' if args.dep else 'OFF'} "
+        f"only_failures={'ON' if args.only_failures else 'OFF'} "
+        f"verbose={'ON' if args.verbose else 'OFF'}"
     )
     print("")
 
@@ -272,9 +301,11 @@ def main() -> int:
             print(f"[run_all_model_tests] running {name} ...")
 
         extra_args: List[str] = []
-        # If user wants -of, pass through to dependency test if supported.
-        if name == "model_dependencies" and args.only_failures:
-            extra_args.append("--only-failures")
+
+        # IMPORTANT: do NOT forward "--only-failures" or any other runner-only flags to
+        # test_model_dependencies.py; it doesn't accept them and will argparse-error.
+        if name == "model_dependencies":
+            extra_args = []
 
         n, code, out, err = run_one(
             name,
@@ -287,7 +318,7 @@ def main() -> int:
         status = classify_status(code, err)
         results.append((n, status, code))
 
-        # Capture dep json path for -v troubleshooting
+        # Capture dependency JSON path for -v troubleshooting
         if name == "model_dependencies":
             dep_status = status
             dep_json_path = (
@@ -327,17 +358,20 @@ def main() -> int:
             print(f"{name:28s} {status}")
 
     # -v behavior: only with -dep, and only if dependency failed/error.
+    # Enhancement: print the JSON path we found (even if we fail to parse it).
     if args.dep and args.verbose and dep_status in ("FAIL", "ERROR"):
         print("")
         print("=== DEPENDENCY DEBUG (-v) ===")
+        if dep_json_path:
+            print(f"dependency_json_candidate={dep_json_path}")
         if dep_json_path and dep_json_path.exists():
             try:
                 data = json.loads(dep_json_path.read_text(encoding="utf-8"))
-                print(f"dependency_json={dep_json_path}")
                 print(json.dumps(data, indent=2, sort_keys=True))
             except Exception as e:
                 print(
-                    f"Could not read/parse dependency JSON at {dep_json_path}: {type(e).__name__}:{e}"
+                    f"Could not read/parse dependency JSON at {dep_json_path}: "
+                    f"{type(e).__name__}:{e}"
                 )
         else:
             print(

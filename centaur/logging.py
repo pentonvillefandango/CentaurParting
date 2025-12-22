@@ -23,13 +23,10 @@ def format_duration_s_style1(duration_s: Optional[float]) -> Optional[str]:
     Style 1:
       - < 1s  ->  "###ms"
       - >= 1s ->  "#.##s" (under 10s), "#.#s" (10s+)
-    We intentionally accept seconds here so we can be a drop-in replacement
-    without changing any workers yet.
     """
     if duration_s is None:
         return None
 
-    # Defensive: avoid weird negatives
     if duration_s < 0:
         return f"{duration_s:.2f}s"
 
@@ -48,6 +45,7 @@ class LoggingConfig:
     """
     Configuration for logging behavior.
     """
+
     enabled: bool = True
     module_verbosity: Dict[str, bool] = field(default_factory=dict)
 
@@ -58,13 +56,6 @@ class LoggingConfig:
 class Logger:
     """
     Structured, thread-safe console logger for Centaur Parting.
-
-    Design goals:
-    - Readable with long FITS filenames
-    - Atomic log blocks (no interleaving across threads)
-    - Supports separate expected counts for read vs write
-    - No database writes
-    - No business logic
     """
 
     def __init__(self, config: LoggingConfig) -> None:
@@ -89,12 +80,6 @@ class Logger:
         status: str,
         duration_s: Optional[float] = None,
     ) -> None:
-        """
-        Log the standard per-module summary block.
-
-        expected_read / expected_written allow:
-          6/6 read | 12/12 written
-        """
         if not self._config.enabled:
             return
 
@@ -112,7 +97,7 @@ class Logger:
                 line += f" | {dur_txt}"
 
             print(line)
-            print()  # blank line between blocks for readability
+            print()
 
     def log_failure(
         self,
@@ -123,9 +108,6 @@ class Logger:
         reason: str,
         duration_s: Optional[float] = None,
     ) -> None:
-        """
-        Log a module failure and the configured action taken.
-        """
         if not self._config.enabled:
             return
 
@@ -139,29 +121,53 @@ class Logger:
                 line += f" | {dur_txt}"
 
             print(line)
-            print()  # blank line between blocks
+            print()
 
     def log_verbose_fields(
         self,
         module: str,
         fields: Dict[str, Any],
     ) -> None:
-        """
-        Log verbose per-field output for a module, if enabled.
-
-        Best practice: call this immediately after log_module_summary for the same module
-        (or use log_module_result()).
-        """
         if not self._config.is_verbose(module):
             return
-
         if not self._config.enabled:
             return
 
         with self._lock:
             for key, value in fields.items():
                 print(f"    {key}={value}")
-            print()  # blank line after verbose dump
+            print()
+
+    def _print_verbose_fields(
+        self, module: str, verbose_fields: Dict[str, Any]
+    ) -> None:
+        """
+        Supports either:
+          - flat dict: {"a":1,"b":2}
+          - IO dict: {"__inputs__": {...}, "__outputs__": {...}}
+        """
+        if not self._config.is_verbose(module):
+            return
+
+        if "__inputs__" in verbose_fields or "__outputs__" in verbose_fields:
+            inputs = verbose_fields.get("__inputs__") or {}
+            outputs = verbose_fields.get("__outputs__") or {}
+
+            if inputs:
+                print("    inputs:")
+                for k, v in inputs.items():
+                    print(f"      {k}={v}")
+
+            if outputs:
+                print("    outputs:")
+                for k, v in outputs.items():
+                    print(f"      {k}={v}")
+
+            return
+
+        # fallback: flat
+        for key, value in verbose_fields.items():
+            print(f"    {key}={value}")
 
     def log_module_result(
         self,
@@ -177,8 +183,7 @@ class Logger:
         verbose_fields: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
-        Convenience: prints summary + optional verbose fields as one atomic block,
-        so output never gets visually interleaved.
+        Convenience: prints summary + optional verbose fields as one atomic block.
         """
         if not self._config.enabled:
             return
@@ -198,7 +203,6 @@ class Logger:
             print(line)
 
             if verbose_fields is not None and self._config.is_verbose(module):
-                for key, value in verbose_fields.items():
-                    print(f"    {key}={value}")
+                self._print_verbose_fields(module, verbose_fields)
 
-            print()  # blank line between blocks
+            print()

@@ -30,6 +30,7 @@ from centaur.schema_signal_structure import ensure_signal_structure_schema
 from centaur.schema_nebula_mask import ensure_nebula_mask_schema
 from centaur.schema_masked_signal import ensure_masked_signal_schema
 from centaur.schema_star_headroom import ensure_star_headroom_schema
+from centaur.schema_frame_quality import ensure_frame_quality_schema
 
 
 def main() -> None:
@@ -58,6 +59,7 @@ def main() -> None:
     ensure_masked_signal_schema(cfg.db_path)
     ensure_star_headroom_schema(cfg.db_path)
     ensure_migrations(cfg.db_path)
+    ensure_frame_quality_schema(cfg.db_path)
 
     watcher = Watcher(cfg, logger)
     watcher.start()

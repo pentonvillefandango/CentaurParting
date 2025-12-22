@@ -73,6 +73,7 @@ class AppConfig:
             "nebula_mask_worker": True,
             "masked_signal_worker": True,
             "star_headroom_worker": True,
+            "frame_quality_worker": True,
         }
     )
 
@@ -118,6 +119,57 @@ class AppConfig:
     star_headroom_sample_radius_px: int = 3
     star_headroom_peak_percentile: float = 99
 
+    # Frame quality (v1 fixed-threshold scoring)
+    quality_reject_saturated_pixel_fraction: float = 0.0005
+    quality_warn_saturated_pixel_fraction: float = 0.0001
+
+    quality_reject_min_stars_measured: int = 30
+    quality_warn_min_stars_measured: int = 80
+
+    quality_reject_ecc_median: float = 0.70
+    quality_warn_ecc_median: float = 0.55
+
+    quality_reject_fwhm_px_median: float = 12.0
+    quality_warn_fwhm_px_median: float = 8.0
+
+    quality_warn_plane_slope_mag_adu_per_tile: float = 50.0
+    quality_warn_grad_p95_adu_per_tile: float = 80.0
+    quality_warn_corner_delta_adu: float = 500.0
+    quality_warn_bkg2d_rms_of_map_adu: float = 200.0
+
+    quality_warn_if_score_below: int = 70
+    quality_cap_score_on_warn: int = 70
+    quality_cap_score_on_reject: int = 30
+    # ---------------------------------------------------------------------
+    # Frame quality v1.1 (per-image only; no rolling/session context yet)
+    # Expands scoring to include: signal, headroom, psf robustness.
+    # ---------------------------------------------------------------------
+
+    # --- Signal (per-image) ---
+    # Uses roi_signal_metrics.obj_minus_bg_adu_s when available.
+    # If missing/unusable, signal scoring should degrade confidence rather than hard fail.
+    quality_warn_min_obj_minus_bg_adu_s: float = 0.0
+
+    # Uses masked_signal_metrics.nebula_minus_bg_adu_s when available (and usable).
+    # (Optional enhancement: only consider if nebula mask usable, otherwise ignore.)
+    quality_warn_min_nebula_minus_bg_adu_s: float = 0.0
+
+    # --- PSF robustness (per-image) ---
+    # Use psf_basic_metrics.ecc_p90 to catch “some stars are ugly” frames.
+    quality_reject_ecc_p90: float = 0.85
+    quality_warn_ecc_p90: float = 0.70
+
+    # Use psf_basic_metrics.fwhm_px_p90 as a “worst-case seeing/focus” proxy.
+    quality_warn_fwhm_px_p90: float = 10.0
+
+    # Spread = p90 - p10: catches instability / variable HFR across the frame.
+    quality_warn_fwhm_spread_px: float = 4.0
+
+    # --- Star headroom (per-image) ---
+    # Uses star_headroom_metrics.headroom_p99.
+    # headroom is typically in [0,1] where lower = closer to saturation.
+    quality_warn_headroom_p99_below: float = 0.10
+
     def is_module_enabled(self, module_name: str) -> bool:
         return self.enabled_modules.get(module_name, False)
 
@@ -151,7 +203,8 @@ def default_config() -> AppConfig:
                 "signal_structure_worker": False,
                 "nebula_mask_worker": False,
                 "masked_signal_worker": False,
-                "star_headroom_worker": True,
+                "star_headroom_worker": False,
+                "frame_quality_worker": True,
             },
         ),
     )

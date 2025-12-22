@@ -16,7 +16,12 @@
 #   - Payload deep checks:
 #       payload present and parseable
 #       payload interpreted into a key/value mapping
-#       required keys present (case-insensitive)
+#       required keys present (case-insensitive), with policy:
+#           - Always require INSTRUME, IMAGETYP
+#           - Require EXPTIME (or accept EXPOSURE as fallback)
+#           - Require OBJECT only for LIGHT
+#           - Require FILTER only if header indicates a filter concept (FILTER/FILTER1/FILTER2/FWHEEL present)
+#             Otherwise if OSC hint (BAYERPAT present), FILTER is not required (treat as "none")
 #
 # Outputs:
 #   JSON results (always)
@@ -54,7 +59,15 @@ PAYLOAD_CANDIDATES = (
     "data",
 )
 
-REQUIRED_KEYS = ["INSTRUME", "IMAGETYP", "FILTER", "EXPTIME", "OBJECT"]
+# Policy knobs (payload layout)
+BASE_REQUIRED_KEYS = ["INSTRUME", "IMAGETYP"]
+EXPTIME_KEYS = ["EXPTIME", "EXPOSURE"]  # accept either; EXPTIME preferred
+LIGHT_ONLY_REQUIRED_KEYS = ["OBJECT"]
+
+# FILTER logic:
+# - if any of these exist anywhere, require FILTER to exist and be non-empty
+FILTERISH_KEYS = ["FILTER", "FILTER1", "FILTER2", "FWHEEL"]
+OSC_HINT_KEYS = ["BAYERPAT"]
 
 
 def _stamp_now() -> str:
@@ -183,6 +196,13 @@ def _json_get_ci(d: Dict[str, Any], key: str) -> Any:
     return None
 
 
+def _has_any_key_ci(d: Dict[str, Any], keys: List[str]) -> bool:
+    for k in keys:
+        if _json_get_ci(d, k) is not None:
+            return True
+    return False
+
+
 def _parse_fits_card_line(s: str) -> Optional[Tuple[str, str]]:
     """
     Tiny FITS-ish parser:
@@ -248,6 +268,14 @@ def _payload_to_kv_map(obj: Any) -> Optional[Dict[str, Any]]:
         return out if out else None
 
     return None
+
+
+def _is_blank(v: Any) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, str) and not v.strip():
+        return True
+    return False
 
 
 def main() -> int:
@@ -424,6 +452,9 @@ def main() -> int:
                 if imagetyp == "LIGHT":
                     if not str(r.get("instrume") or "").strip():
                         _add_issue(issues, "instrume_empty_for_light")
+
+                # Wide layout: keep original behavior (strict on schema presence, but not forcing filter/object here)
+                # Note: wide layout implies those columns exist; their emptiness can be handled by downstream tests if needed.
             else:
                 if not payload_col:
                     _add_issue(issues, "no_payload_column_found")
@@ -447,13 +478,48 @@ def main() -> int:
                             if kv is None:
                                 _add_issue(issues, "payload_json_uninterpretable")
                             else:
+                                # Determine image type from payload (case-insensitive)
+                                imagetyp_v = _json_get_ci(kv, "IMAGETYP")
+                                imagetyp_u = str(imagetyp_v or "").strip().upper()
+
+                                # Required keys per policy
                                 missing_any = False
-                                for k in REQUIRED_KEYS:
-                                    v = _json_get_ci(kv, k)
-                                    if v is None or (
-                                        isinstance(v, str) and not v.strip()
-                                    ):
+
+                                # Always required
+                                for k in BASE_REQUIRED_KEYS:
+                                    if _is_blank(_json_get_ci(kv, k)):
                                         missing_any = True
+
+                                # Exposure time: accept EXPTIME or EXPOSURE (either non-blank)
+                                exptime_present = False
+                                for k in EXPTIME_KEYS:
+                                    if not _is_blank(_json_get_ci(kv, k)):
+                                        exptime_present = True
+                                        break
+                                if not exptime_present:
+                                    _add_issue(issues, "missing_exptime_and_exposure")
+                                    missing_any = True
+
+                                # OBJECT required only for LIGHT
+                                if imagetyp_u == "LIGHT":
+                                    for k in LIGHT_ONLY_REQUIRED_KEYS:
+                                        if _is_blank(_json_get_ci(kv, k)):
+                                            missing_any = True
+
+                                # FILTER policy:
+                                # If header indicates filter concept exists -> require FILTER non-blank.
+                                has_filterish = _has_any_key_ci(kv, FILTERISH_KEYS)
+                                has_osc_hint = _has_any_key_ci(kv, OSC_HINT_KEYS)
+
+                                if has_filterish:
+                                    if _is_blank(_json_get_ci(kv, "FILTER")):
+                                        missing_any = True
+                                else:
+                                    # No filterish keys at all:
+                                    # - If OSC hint present (BAYERPAT), FILTER is not required (treat as "none")
+                                    # - Otherwise, also do not require (unknown ecosystem)
+                                    _ = has_osc_hint  # kept for readability / future warnings
+
                                 if missing_any:
                                     _add_issue(
                                         issues, "required_key_missing_in_payload_json"
@@ -619,7 +685,13 @@ def main() -> int:
             "max_fail_rows_captured": int(args.max_fail_rows),
             "output_dir": str(run_base),
             "join_sql": join_sql.strip(),
-            "required_keys_for_payload_json": REQUIRED_KEYS,
+            "policy": {
+                "base_required_keys": BASE_REQUIRED_KEYS,
+                "exptime_keys_any_of": EXPTIME_KEYS,
+                "light_only_required_keys": LIGHT_ONLY_REQUIRED_KEYS,
+                "filterish_keys_trigger_required_filter": FILTERISH_KEYS,
+                "osc_hint_keys": OSC_HINT_KEYS,
+            },
         },
     }
 

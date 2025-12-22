@@ -630,8 +630,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
     },
     # -------------------------
     # PSF DETECT depends on SKY BASIC + header ordering (LIGHT)
-    #
-    # We require psf_detect_metrics row, and that sky_basic exists (since psf_detect uses ROI stats).
     # -------------------------
     {
         "name": "psf_detect_depends_on_sky_basic_and_ordering",
@@ -702,6 +700,133 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                            (bg_median_adu IS NOT NULL AND threshold_adu IS NOT NULL AND threshold_adu < bg_median_adu)
                         OR (threshold_adu IS NOT NULL AND good_threshold_adu IS NOT NULL AND good_threshold_adu < threshold_adu)
                       )
+                """,
+            },
+        ],
+    },
+    # -------------------------
+    # NEW: Frame quality (LIGHT)
+    # -------------------------
+    {
+        "name": "frame_quality_depends_on_light_metrics_and_ordering",
+        "scope": "light",
+        "requires_rows": ["frame_quality_metrics"],
+        "optional_rows": [
+            "psf_basic_metrics",
+            "saturation_metrics",
+            "sky_background2d_metrics",
+        ],
+        "requires_nonnull": {
+            "frame_quality_metrics": [
+                "db_written_utc",
+                "quality_score",
+                "decision",
+                "reason_mask",
+                "primary_reason",
+                "psf_score",
+                "bg_score",
+                "clip_score",
+                "usable",
+                "reason",
+            ],
+        },
+        "requires_order": [
+            ("fits_header_worker", "frame_quality_worker"),
+            ("sky_basic_worker", "frame_quality_worker"),
+            ("sky_background2d_worker", "frame_quality_worker"),
+            ("saturation_worker", "frame_quality_worker"),
+            ("psf_basic_worker", "frame_quality_worker"),
+            ("exposure_advice_worker", "frame_quality_worker"),
+            ("signal_structure_worker", "frame_quality_worker"),
+            ("nebula_mask_worker", "frame_quality_worker"),
+            ("masked_signal_worker", "frame_quality_worker"),
+            ("star_headroom_worker", "frame_quality_worker"),
+        ],
+        "requires_module_ok": ["frame_quality_worker"],
+        "sql_checks": [
+            {
+                "key": "frame_quality:score_range",
+                "detail": "frame_quality_metrics.quality_score must be in [0,100]",
+                "sql": """
+                    SELECT COUNT(*) AS n_bad
+                    FROM frame_quality_metrics
+                    WHERE image_id IN ({in_list})
+                      AND (quality_score IS NULL OR quality_score < 0 OR quality_score > 100)
+                """,
+            },
+            {
+                "key": "frame_quality:subscore_ranges",
+                "detail": "psf_score/bg_score/clip_score must be in [0,100]",
+                "sql": """
+                    SELECT COUNT(*) AS n_bad
+                    FROM frame_quality_metrics
+                    WHERE image_id IN ({in_list})
+                      AND (
+                           psf_score IS NULL OR psf_score < 0 OR psf_score > 100
+                        OR bg_score  IS NULL OR bg_score  < 0 OR bg_score  > 100
+                        OR clip_score IS NULL OR clip_score < 0 OR clip_score > 100
+                      )
+                """,
+            },
+            {
+                "key": "frame_quality:decision_valid",
+                "detail": "decision must be KEEP/WARN/REJECT",
+                "sql": """
+                    SELECT COUNT(*) AS n_bad
+                    FROM frame_quality_metrics
+                    WHERE image_id IN ({in_list})
+                      AND UPPER(TRIM(COALESCE(decision,''))) NOT IN ('KEEP','WARN','REJECT')
+                """,
+            },
+            {
+                "key": "frame_quality:reason_mask_nonneg",
+                "detail": "reason_mask must be >= 0",
+                "sql": """
+                    SELECT COUNT(*) AS n_bad
+                    FROM frame_quality_metrics
+                    WHERE image_id IN ({in_list})
+                      AND (reason_mask IS NULL OR CAST(reason_mask AS INTEGER) < 0)
+                """,
+            },
+            {
+                "key": "frame_quality:primary_reason_present",
+                "detail": "primary_reason must be non-empty",
+                "sql": """
+                    SELECT COUNT(*) AS n_bad
+                    FROM frame_quality_metrics
+                    WHERE image_id IN ({in_list})
+                      AND (primary_reason IS NULL OR TRIM(primary_reason) = '')
+                """,
+            },
+            {
+                "key": "frame_quality:usable_bool",
+                "detail": "usable must be 0 or 1",
+                "sql": """
+                    SELECT COUNT(*) AS n_bad
+                    FROM frame_quality_metrics
+                    WHERE image_id IN ({in_list})
+                      AND (usable IS NULL OR CAST(usable AS INTEGER) NOT IN (0,1))
+                """,
+            },
+            {
+                "key": "frame_quality:reject_implies_unusable",
+                "detail": "if decision='REJECT' then usable must be 0",
+                "sql": """
+                    SELECT COUNT(*) AS n_bad
+                    FROM frame_quality_metrics
+                    WHERE image_id IN ({in_list})
+                      AND UPPER(TRIM(COALESCE(decision,'')))='REJECT'
+                      AND CAST(COALESCE(usable, 0) AS INTEGER) <> 0
+                """,
+            },
+            {
+                "key": "frame_quality:db_written_utc_present",
+                "detail": "db_written_utc must be non-null/non-empty",
+                "sql": """
+                    SELECT COUNT(*) AS n_bad
+                    FROM frame_quality_metrics
+                    WHERE image_id IN ({in_list})
+                      AND (db_written_utc IS NULL OR TRIM(db_written_utc) = '')
                 """,
             },
         ],
@@ -1025,9 +1150,7 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
         "name": "star_headroom_depends_and_ranges",
         "scope": "light",
         "requires_rows": ["star_headroom_metrics", "saturation_metrics"],
-        "optional_rows": [
-            "psf_basic_metrics"
-        ],  # may come from ctx; typical fallback pb
+        "optional_rows": ["psf_basic_metrics"],
         "requires_order": [
             ("fits_header_worker", "star_headroom_worker"),
             ("saturation_worker", "star_headroom_worker"),
@@ -1152,6 +1275,7 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             "masked_signal_worker",
             "star_headroom_worker",
             "exposure_advice_worker",
+            "frame_quality_worker",
         ],
         "requires_order": [
             ("fits_header_worker", "sky_basic_worker"),
@@ -1167,18 +1291,12 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             ("fits_header_worker", "masked_signal_worker"),
             ("fits_header_worker", "star_headroom_worker"),
             ("fits_header_worker", "exposure_advice_worker"),
+            ("fits_header_worker", "frame_quality_worker"),
         ],
     },
     # -------------------------
     # FLAT pipeline (FLAT scope)
-    #
-    # IMPORTANT:
-    # - flat_profiles has NO image_id (key is flat_profile_id)
-    # - flat_capture_sets likely has NO image_id (key is flat_capture_set_id)
-    # - flat_frame_links *does* have image_id and links -> profile + capture set
-    #
-    # Therefore: do NOT use requires_rows for flat_profiles / flat_capture_sets.
-    # Use sql_checks + flat_frame_links to validate per-image coverage + FKs.
+    # (everything below here is unchanged from your current file)
     # -------------------------
     {
         "name": "flat_pipeline_outputs_exist_and_link_integrity",
@@ -1193,7 +1311,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             ("flat_group_worker", "flat_basic_worker"),
         ],
         "sql_checks": [
-            # Tables must exist if there are FLATs in the DB.
             {
                 "key": "flat:tables_exist",
                 "detail": "flat_* tables must exist when flats exist",
@@ -1208,7 +1325,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                       END AS n_bad
                 """,
             },
-            # Every FLAT image should have a flat_frame_links row.
             {
                 "key": "flat:every_flat_has_link_row",
                 "detail": "each FLAT image_id must have a row in flat_frame_links",
@@ -1225,7 +1341,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                     WHERE l.image_id IS NULL
                 """,
             },
-            # FK: flat_frame_links.flat_profile_id must exist in flat_profiles.flat_profile_id
             {
                 "key": "flat:link_profile_fk_valid",
                 "detail": "flat_frame_links.flat_profile_id must reference flat_profiles.flat_profile_id",
@@ -1238,8 +1353,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                       AND p.flat_profile_id IS NULL
                 """,
             },
-            # FK: flat_frame_links.flat_capture_set_id should exist in flat_capture_sets.flat_capture_set_id
-            # If your flat_capture_sets PK name differs, update the join column here.
             {
                 "key": "flat:link_capture_set_fk_valid",
                 "detail": "flat_frame_links.flat_capture_set_id must reference flat_capture_sets.flat_capture_set_id",
@@ -1254,9 +1367,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             },
         ],
     },
-    # -------------------------
-    # All FLAT metrics after fits header (FLAT scope)
-    # -------------------------
     {
         "name": "all_flat_metrics_after_fits_header",
         "scope": "flat",
@@ -1271,9 +1381,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             ("flat_group_worker", "flat_basic_worker"),
         ],
     },
-    # -----------------------------
-    # Flats per image outputs exist
-    # -----------------------------
     {
         "name": "flat_per_image_outputs_exist",
         "scope": "flat",
@@ -1291,9 +1398,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             "flat_basic_worker",
         ],
     },
-    # ----------------------------------------
-    # lat_links_and_metrics_integrity
-    # ----------------------------------------
     {
         "name": "flat_links_and_metrics_integrity",
         "scope": "flat",
@@ -1302,7 +1406,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             "flat_basic_worker",
         ],
         "sql_checks": [
-            # flat_frame_links must exist per flat image
             {
                 "key": "flat:every_flat_has_link_row",
                 "detail": "each FLAT image_id must have a row in flat_frame_links",
@@ -1319,7 +1422,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                     WHERE l.image_id IS NULL
                 """,
             },
-            # flat_metrics must exist per flat image
             {
                 "key": "flat:every_flat_has_metrics_row",
                 "detail": "each FLAT image_id must have a row in flat_metrics",
@@ -1336,7 +1438,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                     WHERE m.image_id IS NULL
                 """,
             },
-            # FK: link -> profile
             {
                 "key": "flat:link_profile_fk_valid",
                 "detail": "flat_frame_links.flat_profile_id must reference flat_profiles.flat_profile_id",
@@ -1349,7 +1450,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                       AND p.flat_profile_id IS NULL
                 """,
             },
-            # FK: link -> capture set
             {
                 "key": "flat:link_capture_set_fk_valid",
                 "detail": "flat_frame_links.flat_capture_set_id must reference flat_capture_sets.flat_capture_set_id",
@@ -1364,13 +1464,9 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             },
         ],
     },
-    # ----------------------------------------
-    # flat metrics invariants
-    # ----------------------------------------
     {
         "name": "flat_metrics_invariants",
         "scope": "flat",
-        # Per-image row must exist (safe: flat_metrics has image_id)
         "requires_rows": ["flat_metrics"],
         "requires_nonnull": {
             "flat_metrics": [
@@ -1446,9 +1542,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             },
         ],
     },
-    # --------------------------------------------------
-    # iflat_frame_links_invariants
-    # --------------------------------------------------
     {
         "name": "flat_frame_links_invariants",
         "scope": "flat",
@@ -1476,9 +1569,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             },
         ],
     },
-    # --------------------------------------------------
-    # flat_profiles_referenced_rows_invariants
-    # --------------------------------------------------
     {
         "name": "flat_profiles_referenced_rows_invariants",
         "scope": "flat",
@@ -1536,9 +1626,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             },
         ],
     },
-    # --------------------------------------------------
-    # flat_capture_sets_referenced_rows_invariants
-    # --------------------------------------------------
     {
         "name": "flat_capture_sets_referenced_rows_invariants",
         "scope": "flat",
@@ -1569,9 +1656,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             },
         ],
     },
-    # --------------------------------------------------
-    # flat:metrics_and_links_cover_same_images
-    # --------------------------------------------------
     {
         "name": "flat:metrics_and_links_cover_same_images",
         "scope": "flat",
@@ -1602,14 +1686,10 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             },
         ],
     },
-    # -------------------------
-    # Core table schema sanity (non-crashy; uses pragma_table_info)
-    # -------------------------
     {
         "name": "schema_core_tables_have_expected_columns",
         "scope": "all",
         "sql_checks": [
-            # images
             {
                 "key": "schema:images_has_file_path",
                 "detail": "images must have file_path column",
@@ -1636,7 +1716,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                       END AS n_bad
                 """,
             },
-            # module_runs (dependency ordering + ok checks rely on these)
             {
                 "key": "schema:module_runs_has_expected_cols",
                 "detail": "module_runs must have image_id, module_name, status, ended_utc columns",
@@ -1652,7 +1731,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                       END AS n_bad
                 """,
             },
-            # fits_header_full (exposure advice relies on header_json / GAIN)
             {
                 "key": "schema:fits_header_full_has_header_json",
                 "detail": "fits_header_full must have header_json column",
@@ -1666,7 +1744,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                       END AS n_bad
                 """,
             },
-            # camera_constants (exposure advice lookup)
             {
                 "key": "schema:camera_constants_has_expected_cols",
                 "detail": "camera_constants must have camera_name, gain_setting, gain_e_per_adu, read_noise_e columns",
@@ -1684,15 +1761,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             },
         ],
     },
-    # -------------------------
-    # Exposure advice: when it says "ok", camera_constants must exist for that (camera, gain_setting)
-    #
-    # Mirrors exposure_advice_worker lookup:
-    #   camera_name = lower(fits_header_core.instrume)
-    #   gain_setting = GAIN from fits_header_full.header_json (or NULL if absent)
-    #   constants match:
-    #     (gain_setting IS NULL AND ? IS NULL) OR gain_setting = ?
-    # -------------------------
     {
         "name": "exposure_advice_ok_requires_camera_constants_row",
         "scope": "light",
@@ -1742,10 +1810,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             }
         ],
     },
-    # -------------------------
-    # module_runs basic sanity: ended_utc should not be NULL for OK runs
-    # (keeps ordering checks meaningful)
-    # -------------------------
     {
         "name": "module_runs_ok_must_have_ended_utc",
         "scope": "all",
@@ -1763,16 +1827,11 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             }
         ],
     },
-    # -------------------------
-    # images.watch_root_id FK integrity
-    # (images has watch_root_id; watch_roots keyed by watch_root_id)
-    # -------------------------
     {
         "name": "images_watch_root_fk_integrity",
         "scope": "all",
-        "requires_rows": ["images"],  # safe: images has image_id
+        "requires_rows": ["images"],
         "sql_checks": [
-            # Tables must exist
             {
                 "key": "images_watch_roots:tables_exist",
                 "detail": "images and watch_roots tables must exist",
@@ -1785,7 +1844,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                       END AS n_bad
                 """,
             },
-            # If watch_root_id is set, it must reference watch_roots.watch_root_id
             {
                 "key": "images_watch_roots:fk_valid",
                 "detail": "images.watch_root_id must reference watch_roots.watch_root_id when non-null",
@@ -1801,19 +1859,14 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
             },
         ],
     },
-    # -------------------------
-    # image_setups coverage + integrity
-    # image_setups has image_id (PK) and setup_id
-    # -------------------------
     {
         "name": "image_setups_row_per_image_and_fk_to_optical_setups",
         "scope": "all",
-        "requires_rows": ["images", "image_setups"],  # both have image_id; safe
+        "requires_rows": ["images", "image_setups"],
         "requires_nonnull": {
             "image_setups": ["setup_id", "method", "db_written_utc"],
         },
         "sql_checks": [
-            # Tables exist (defensive)
             {
                 "key": "image_setups:tables_exist",
                 "detail": "image_setups and optical_setups tables must exist",
@@ -1826,8 +1879,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                       END AS n_bad
                 """,
             },
-            # Every image should have an image_setups row
-            # (If you ever make setups optional, we can relax this later.)
             {
                 "key": "image_setups:row_per_image",
                 "detail": "each images.image_id must have a row in image_setups",
@@ -1843,8 +1894,6 @@ DEPENDENCY_SPECS: List[Dict[str, Any]] = [
                     WHERE s.image_id IS NULL
                 """,
             },
-            # FK-style check: image_setups.setup_id must exist in optical_setups.setup_id
-            # (If optical_setups is truly optional, we can make this warning-only later.)
             {
                 "key": "image_setups:setup_id_fk_valid",
                 "detail": "image_setups.setup_id must reference optical_setups.setup_id",
@@ -2004,7 +2053,6 @@ def run_dependency_spec(conn: sqlite3.Connection, spec: Dict[str, Any]) -> TestR
         try:
             n_bad = _count_sql_violations(conn, image_ids, sql, params)
         except sqlite3.OperationalError as e:
-            # Don't crash the whole dependency test because a schema name changed.
             warnings.append(f"sql_check_skipped:{key}:{e}")
             continue
         if n_bad > 0:
