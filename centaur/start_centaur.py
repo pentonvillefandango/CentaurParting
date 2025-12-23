@@ -32,6 +32,22 @@ from centaur.schema_masked_signal import ensure_masked_signal_schema
 from centaur.schema_star_headroom import ensure_star_headroom_schema
 from centaur.schema_frame_quality import ensure_frame_quality_schema
 
+# NEW: training layer schemas
+from centaur.schema_training_sessions import ensure_training_sessions_schema
+from centaur.schema_training_session_frames import ensure_training_session_frames_schema
+from centaur.schema_training_session_results import (
+    ensure_training_session_results_schema,
+)
+from centaur.schema_dark_library_profiles import ensure_dark_library_profiles_schema
+from centaur.schema_dark_library_exposures import ensure_dark_library_exposures_schema
+from centaur.schema_observing_conditions import ensure_observing_conditions_schema
+from centaur.schema_training_derived_metrics import (
+    ensure_training_derived_metrics_schema,
+)
+
+# NEW: preflight to avoid surprise downloads mid-run
+from centaur.iers_preflight import ensure_iers_ready
+
 
 def main() -> None:
     cfg = default_config()
@@ -60,6 +76,22 @@ def main() -> None:
     ensure_star_headroom_schema(cfg.db_path)
     ensure_migrations(cfg.db_path)
     ensure_frame_quality_schema(cfg.db_path)
+
+    # --------------------------------------------------
+    # Training / advice data layer schemas
+    # --------------------------------------------------
+    ensure_training_sessions_schema(cfg.db_path)
+    ensure_training_session_frames_schema(cfg.db_path)
+    ensure_training_session_results_schema(cfg.db_path)
+
+    ensure_dark_library_profiles_schema(cfg.db_path)
+    ensure_dark_library_exposures_schema(cfg.db_path)
+
+    ensure_observing_conditions_schema(cfg.db_path)
+    ensure_training_derived_metrics_schema(cfg.db_path)
+
+    # NEW: preflight IERS data once at startup
+    ensure_iers_ready(logger)
 
     watcher = Watcher(cfg, logger)
     watcher.start()

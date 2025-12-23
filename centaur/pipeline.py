@@ -77,10 +77,18 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
     from centaur.masked_signal_worker import process_file_event as masked_signal_process
     from centaur.star_headroom_worker import process_file_event as star_headroom_process
     from centaur.frame_quality_worker import process_file_event as frame_quality_process
+    from centaur.observing_conditions_worker import (
+        process_file_event as observing_conditions_process,
+    )
+    from centaur.training_derived_worker import (
+        process_file_event as training_derived_process,
+    )
 
     return {
         # Must run first
         "fits_header_worker": fits_header_process,
+        # Observing conditions - part of training
+        "observing_conditions_worker": observing_conditions_process,
         # Flats
         "flat_group_worker": flat_group_process,
         "flat_basic_worker": flat_basic_process,
@@ -103,6 +111,7 @@ def build_worker_registry() -> Dict[str, WorkerFn]:
         "star_headroom_worker": star_headroom_process,
         # Final synthesis
         "frame_quality_worker": frame_quality_process,
+        "training_derived_worker": training_derived_process,
     }
 
 
@@ -278,6 +287,8 @@ def run_pipeline_for_event(
             "masked_signal_worker",
             "star_headroom_worker",
             "frame_quality_worker",
+            "observing_conditions_worker",
+            "training_derived_worker",
         ):
             if cfg.is_module_enabled(name):
                 result.skipped += 1
@@ -305,6 +316,8 @@ def run_pipeline_for_event(
         "star_headroom_worker",
         "exposure_advice_worker",
         "frame_quality_worker",
+        "observing_conditions_worker",
+        "training_derived_worker",
     ):
         _run_one(cfg, logger, event, registry, result, ctx, name, db)
 

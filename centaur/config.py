@@ -74,6 +74,9 @@ class AppConfig:
             "masked_signal_worker": True,
             "star_headroom_worker": True,
             "frame_quality_worker": True,
+            # Training worker
+            "observing_conditions_worker": True,
+            "training_derived_worker": True,
         }
     )
 
@@ -204,7 +207,9 @@ def default_config() -> AppConfig:
                 "nebula_mask_worker": False,
                 "masked_signal_worker": False,
                 "star_headroom_worker": False,
-                "frame_quality_worker": True,
+                "frame_quality_worker": False,
+                "observing_conditions_worker": True,
+                "training_derived_worker": True,
             },
         ),
     )

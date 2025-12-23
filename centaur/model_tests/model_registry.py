@@ -30,6 +30,13 @@ def get_registry() -> List[ModelTest]:
         "nebula_mask_metrics",
         "masked_signal_metrics",
         "star_headroom_metrics",
+        "training_sessions",
+        "training_session_frames",
+        "dark_library_profiles",
+        "dark_library_exposures",
+        "observing_conditions",
+        "training_derived_metrics",
+        "training_session_results",
     ]
 
     return [ModelTest(t, make_generic_test(t)) for t in tables]
