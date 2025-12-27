@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import textwrap
 from queue import Empty
 from typing import List, Tuple
 
@@ -32,7 +34,7 @@ from centaur.schema_masked_signal import ensure_masked_signal_schema
 from centaur.schema_star_headroom import ensure_star_headroom_schema
 from centaur.schema_frame_quality import ensure_frame_quality_schema
 
-# NEW: training layer schemas
+# Training / advice data layer schemas
 from centaur.schema_training_sessions import ensure_training_sessions_schema
 from centaur.schema_training_session_frames import ensure_training_session_frames_schema
 from centaur.schema_training_session_results import (
@@ -45,11 +47,74 @@ from centaur.schema_training_derived_metrics import (
     ensure_training_derived_metrics_schema,
 )
 
-# NEW: preflight to avoid surprise downloads mid-run
+# Preflight to avoid surprise downloads mid-run
 from centaur.iers_preflight import ensure_iers_ready
+
+# In-process training session monitor
+from centaur.training_session_monitor import start_monitor_thread
+
+
+HELP_TEXT = """
+CentaurParting (cp_start)
+========================
+Starts the realtime FITS watcher + modular metrics pipeline.
+
+Normal dev loop
+---------------
+  cp_db_reset
+  cp_start
+  (drop FITS files into your watcher root)
+
+Training session “easy mode”
+----------------------------
+Enable the monitor inside cp_start (recommended):
+  cp_start --training-monitor
+
+Then start a session (interactive):
+  python3 -m centaur.tools.training_session_start --db data/centaurparting.db
+
+The monitor will:
+  - auto-tag matching LIGHT frames into training_session_frames
+  - log progress 1/9, 2/9, ...
+  - when finish_after is reached, auto-solve + write training_session_results
+  - auto-close the session
+
+If there are NO open sessions, the monitor is essentially idle (cheap query + sleep).
+
+Quick: list setup_id
+--------------------
+  cp_sql
+  SELECT setup_id, telescop, instrume, detector, site_name FROM optical_setups;
+""".strip()
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument(
+        "-h2",
+        "--help2",
+        action="store_true",
+        help="Show extended help (training sessions, workflows, commands) and exit.",
+    )
+
+    ap.add_argument(
+        "--training-monitor",
+        action="store_true",
+        help="Run the training session monitor inside cp_start (auto-tag + auto-close).",
+    )
+    ap.add_argument(
+        "--training-monitor-poll",
+        type=float,
+        default=5.0,
+        help="Training monitor poll interval in seconds (default: 5.0).",
+    )
+
+    args = ap.parse_args()
+
+    if args.help2:
+        print(textwrap.dedent(HELP_TEXT))
+        return
+
     cfg = default_config()
     logger = Logger(cfg.logging)
 
@@ -90,15 +155,25 @@ def main() -> None:
     ensure_observing_conditions_schema(cfg.db_path)
     ensure_training_derived_metrics_schema(cfg.db_path)
 
-    # NEW: preflight IERS data once at startup
+    # Preflight IERS data once at startup
     ensure_iers_ready(logger)
+
+    # Optional: in-process training monitor thread
+    monitor = None
+    if args.training_monitor:
+        _, monitor = start_monitor_thread(
+            db_path=str(cfg.db_path),
+            logger=logger,
+            poll_seconds=float(args.training_monitor_poll),
+            only_usable=True,
+        )
 
     watcher = Watcher(cfg, logger)
     watcher.start()
 
     registry = build_worker_registry()
 
-    # IMPORTANT: pipeline-owned module_runs writer must point at cfg.db_path (not DEFAULT_DB_PATH)
+    # IMPORTANT: pipeline-owned module_runs writer must point at cfg.db_path
     db = Database(DbConfig(db_path=cfg.db_path))
     db.connect()
 
@@ -144,6 +219,9 @@ def main() -> None:
         print("\nStopping...")
 
     finally:
+        if monitor is not None:
+            monitor.stop()
+
         watcher.stop()
         db.close()
 

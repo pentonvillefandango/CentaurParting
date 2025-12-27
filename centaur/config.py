@@ -172,6 +172,62 @@ class AppConfig:
     # Uses star_headroom_metrics.headroom_p99.
     # headroom is typically in [0,1] where lower = closer to saturation.
     quality_warn_headroom_p99_below: float = 0.10
+    # --------------------------------------------------
+    # Training session recommendation defaults
+    # These act as defaults shown in training_session_start prompts.
+    # Session-level overrides are stored in training_sessions.params_json.
+    # --------------------------------------------------
+
+    # Default required filters for evaluation (order matters)
+    training_required_filters_default: list[str] = field(
+        default_factory=lambda: ["SII", "HA", "OIII"]
+    )
+
+    # Minimum linear headroom (p99) to consider an exposure "safe".
+    # 0.10 = keep at least 10% headroom.
+    training_min_linear_headroom_p99: float = 0.10
+
+    # Scoring weights: favor overall quality (mean) vs weakest filter (min)
+    training_score_w_mean: float = 0.55
+    training_score_w_min: float = 0.45
+
+    # Exposure time penalties: discourage extremes within the candidate set
+    training_short_penalty: float = 0.10
+    training_long_penalty: float = 0.08
+
+    # Whether to include excluded candidates + reasons in stats_json
+    training_include_excluded: bool = True
+
+    # Human-friendly explanation threshold:
+    # if best_score - candidate_score < this, we’ll report “close call”
+    training_close_call_delta: float = 0.05
+    # -----------------------------
+    # Training session recommendation defaults
+    # -----------------------------
+    training_required_filters_default: List[str] = field(
+        default_factory=lambda: ["SII", "HA", "OIII"]
+    )
+    training_min_linear_headroom_p99: float = 0.10
+
+    training_score_w_mean: float = 0.55
+    training_score_w_min: float = 0.45
+    training_short_penalty: float = 0.10
+    training_long_penalty: float = 0.08
+    training_include_excluded: bool = True
+    training_close_call_delta: float = 0.05
+
+    # -----------------------------
+    # Ratio recommendation strategy
+    # -----------------------------
+    # Exposure selection is always based on best score.
+    # This controls how the *ratio* is computed.
+    # Options: "best", "second", "aggregate_weighted", "aggregate_equal"
+    training_ratio_strategy: str = "aggregate_weighted"
+
+    # Weighting used by aggregate modes:
+    # "score_weighted" = shifted score weights (stable even if scores negative)
+    # "equal"         = every eligible exposure contributes equally
+    training_ratio_weight_mode: str = "score_weighted"
 
     def is_module_enabled(self, module_name: str) -> bool:
         return self.enabled_modules.get(module_name, False)
@@ -208,8 +264,9 @@ def default_config() -> AppConfig:
                 "masked_signal_worker": False,
                 "star_headroom_worker": False,
                 "frame_quality_worker": False,
-                "observing_conditions_worker": True,
-                "training_derived_worker": True,
+                "observing_conditions_worker": False,
+                "training_derived_worker": False,
+                "training_session_monitor": True,
             },
         ),
     )
