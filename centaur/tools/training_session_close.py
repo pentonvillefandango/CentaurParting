@@ -12,10 +12,6 @@ from centaur.training_session_engine import (
     close_training_session,
 )
 
-# -----------------------------
-# Small helpers
-# -----------------------------
-
 
 def _round(x: Any, nd: int = 3) -> Any:
     try:
@@ -85,351 +81,152 @@ def _fmt_score(x: Any) -> str:
     return _fmt_float(x, nd=3)
 
 
-def _coerce_num(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-def _equal_snr_time_fractions(per_filter_E: Dict[str, float]) -> Dict[str, float]:
-    """
-    Same logic as engine:
-      time ∝ 1/E^2  (equalize SNR)
-    """
-    weights: Dict[str, float] = {}
-    for f, E in per_filter_E.items():
-        try:
-            denom = float(E) * float(E)
-            weights[f] = (1.0 / denom) if denom > 0 else 0.0
-        except Exception:
-            weights[f] = 0.0
-
-    s = sum(weights.values())
-    if s <= 0:
-        n = len(weights) or 1
-        return {f: 1.0 / n for f in weights}
-    return {f: w / s for f, w in weights.items()}
-
-
-def _ratio_vs_ha_from_E(per_filter_E: Dict[str, float]) -> Dict[str, float]:
-    tf = _equal_snr_time_fractions(per_filter_E)
-    ref = "HA" if "HA" in tf else (list(tf.keys())[0] if tf else "HA")
-    ref_frac = tf.get(ref, 1.0) or 1.0
-    out: Dict[str, float] = {}
-    for k, v in tf.items():
-        out[str(k).upper()] = (float(v) / float(ref_frac)) if ref_frac > 0 else 0.0
-    return out
-
-
-def _stable_ratio_line(ratios: Dict[str, Any]) -> str:
-    if not ratios:
-        return ""
+def _fmt_ratio_line(ratio_vs_ha: Dict[str, Any]) -> str:
     parts: List[str] = []
     for k in ["SII", "HA", "OIII"]:
-        if k in ratios:
-            try:
-                parts.append(f"{k} {float(ratios[k]):.2f}x")
-            except Exception:
-                parts.append(f"{k} —")
+        if k in ratio_vs_ha:
+            parts.append(f"{k} {_round(ratio_vs_ha[k], 2):.2f}x")
     if not parts:
-        for k, v in ratios.items():
-            try:
-                parts.append(f"{k} {float(v):.2f}x")
-            except Exception:
-                parts.append(f"{k} —")
+        for k, v in ratio_vs_ha.items():
+            parts.append(f"{k} {_round(v, 2):.2f}x")
     return " | ".join(parts)
-
-
-def _build_comparisons_from_exposure_report(
-    exposure_report: Dict[str, Dict[str, Any]],
-) -> Dict[str, Any]:
-    """
-    Produces:
-      - best (from chosen=True)
-      - second_best (highest score among non-chosen, non-excluded)
-      - aggregate (across all eligible scored exposures)
-    """
-    # Eligible scored candidates (score not None and not excluded)
-    eligible: List[Tuple[str, Dict[str, Any], float]] = []
-    chosen_key: Optional[str] = None
-
-    for k, rep in exposure_report.items():
-        score = _coerce_num(rep.get("score"))
-        excluded = rep.get("excluded_reasons")
-        if rep.get("chosen"):
-            chosen_key = k
-        if score is not None and not excluded:
-            eligible.append((k, rep, float(score)))
-
-    eligible.sort(key=lambda t: t[2], reverse=True)
-
-    best: Optional[Dict[str, Any]] = None
-    second: Optional[Dict[str, Any]] = None
-    agg: Optional[Dict[str, Any]] = None
-
-    def pack(
-        k: str, rep: Dict[str, Any], score: float, *, label: str
-    ) -> Dict[str, Any]:
-        exp_s = None
-        try:
-            exp_s = int(round(float(k)))
-        except Exception:
-            exp_s = k
-
-        Epf = rep.get("E_per_filter") or {}
-        # Normalize keys
-        Epf2: Dict[str, float] = {}
-        for fk, fv in dict(Epf).items():
-            vv = _coerce_num(fv)
-            if vv is not None:
-                Epf2[str(fk).upper()] = float(vv)
-
-        ratios = _ratio_vs_ha_from_E(Epf2) if Epf2 else {}
-        return {
-            "label": label,
-            "exptime_s": exp_s,
-            "score": _coerce_num(score),
-            "E_mean": _coerce_num(rep.get("E_mean")),
-            "E_min": _coerce_num(rep.get("E_min")),
-            "min_linear_headroom_p99": _coerce_num(rep.get("min_linear_headroom_p99")),
-            "filters": rep.get("filters"),
-            "ratio_vs_ha": ratios,
-        }
-
-    # Best: prefer chosen=True, else top-scoring eligible
-    if chosen_key is not None:
-        rep = exposure_report.get(chosen_key) or {}
-        sc = _coerce_num(rep.get("score"))
-        if sc is not None and not rep.get("excluded_reasons"):
-            best = pack(chosen_key, rep, float(sc), label="BEST")
-    if best is None and eligible:
-        k, rep, sc = eligible[0]
-        best = pack(k, rep, sc, label="BEST")
-
-    # Second best: next eligible after best key
-    if eligible:
-        for k, rep, sc in eligible:
-            if best is not None and str(k) == str(best.get("exptime_s")).replace(
-                "s", ""
-            ):
-                # Not reliable; compare keys instead
-                pass
-        best_key = None
-        if best is not None:
-            # best["exptime_s"] may be int; we want original key
-            # safest: use chosen_key if present, else eligible[0][0]
-            best_key = chosen_key or eligible[0][0]
-
-        for k, rep, sc in eligible:
-            if best_key is not None and str(k) == str(best_key):
-                continue
-            second = pack(k, rep, sc, label="2ND")
-            break
-
-    # Aggregate: average E_per_filter across ALL eligible exposures
-    if eligible:
-        sum_E: Dict[str, float] = {}
-        cnt_E: Dict[str, int] = {}
-        exp_list: List[int] = []
-        min_head: Optional[float] = None
-
-        for k, rep, _sc in eligible:
-            try:
-                exp_list.append(int(round(float(k))))
-            except Exception:
-                pass
-
-            lh = _coerce_num(rep.get("min_linear_headroom_p99"))
-            if lh is not None:
-                min_head = lh if (min_head is None or lh < min_head) else min_head
-
-            Epf = rep.get("E_per_filter") or {}
-            for fk, fv in dict(Epf).items():
-                vv = _coerce_num(fv)
-                if vv is None:
-                    continue
-                fk2 = str(fk).upper()
-                sum_E[fk2] = sum_E.get(fk2, 0.0) + float(vv)
-                cnt_E[fk2] = cnt_E.get(fk2, 0) + 1
-
-        avg_E: Dict[str, float] = {}
-        for fk in sum_E.keys():
-            n = cnt_E.get(fk, 0)
-            if n > 0:
-                avg_E[fk] = sum_E[fk] / float(n)
-
-        ratios = _ratio_vs_ha_from_E(avg_E) if avg_E else {}
-
-        # Aggregate score is not meaningful (score depends on penalties across candidate set),
-        # but users want a stable ratio. We still show E_mean/E_min computed from avg_E.
-        E_vals = list(avg_E.values())
-        E_mean = (sum(E_vals) / float(len(E_vals))) if E_vals else None
-        E_min = min(E_vals) if E_vals else None
-
-        agg = {
-            "label": "AGGREGATE",
-            "exptimes_used": sorted(set(exp_list)),
-            "E_per_filter_avg": avg_E,
-            "E_mean": E_mean,
-            "E_min": E_min,
-            "min_linear_headroom_p99": min_head,
-            "ratio_vs_ha": ratios,
-            "note": "Aggregate is averaged across all eligible exposures (stabilizes ratios when you only have 1 frame per filter per exposure).",
-        }
-
-    out: Dict[str, Any] = {}
-    if best is not None:
-        out["best"] = best
-    if second is not None:
-        out["second_best"] = second
-        # Add delta if best exists
-        if (
-            best is not None
-            and best.get("score") is not None
-            and second.get("score") is not None
-        ):
-            try:
-                out["second_best"]["delta_vs_best"] = float(best["score"]) - float(
-                    second["score"]
-                )
-            except Exception:
-                pass
-    if agg is not None:
-        out["aggregate"] = agg
-    return out
-
-
-# -----------------------------
-# Report builder
-# -----------------------------
 
 
 def _build_report_text(payload: Dict[str, Any]) -> str:
     """
     Human-friendly multiline report for logs/CLI.
+
+    IMPORTANT CONTRACT:
+      - Ratio/science comes from engine result["ratios"] (single source of truth).
+      - This file only adapts + formats.
     """
     target = str(payload.get("target_name") or "").strip()
     rec = payload.get("recommended") or {}
     candidates = payload.get("candidates") or []
     excluded = payload.get("excluded") or {}
-    comparisons = payload.get("comparisons") or {}
+    ratios = payload.get("ratios") or {}
 
     rx = rec.get("exptime_s")
-    ratios = rec.get("ratio_vs_ha") or {}
+    ratio_vs_ha = rec.get("ratio_vs_ha") or {}
     one_liner = rec.get("one_liner") or ""
 
     lines: List[str] = []
     lines.append(
         f"TRAINING RECOMMENDATION — {target}" if target else "TRAINING RECOMMENDATION"
     )
-
     if rx is not None:
-        try:
-            lines.append(f"RECOMMENDED: {int(round(float(rx)))}s")
-        except Exception:
-            lines.append(f"RECOMMENDED: {rx}")
-
-    ratio_line = _stable_ratio_line(dict(ratios))
-    if ratio_line:
-        lines.append("RATIO vs HA: " + ratio_line)
-
+        lines.append(f"RECOMMENDED: {int(round(float(rx)))}s")
+    if ratio_vs_ha:
+        lines.append("RATIO vs HA: " + _fmt_ratio_line(ratio_vs_ha))
     if one_liner:
         lines.append(f"SUMMARY: {one_liner}")
 
-    # NEW: comparisons section (best / 2nd / aggregate)
-    if comparisons:
+    # ----------------------------
+    # Ratio comparison (Best / 2nd / Aggregate)
+    # ----------------------------
+    best = ratios.get("best") or {}
+    second = ratios.get("second") or None
+    agg = ratios.get("aggregate") or {}
+    warnings = ratios.get("warnings") or {}
+    used_src = str(ratios.get("source_used") or "").strip()
+
+    if best or second or agg:
         lines.append("")
         lines.append("RATIO COMPARISON (Best / 2nd / Aggregate)")
 
-        best = comparisons.get("best") or {}
-        second = comparisons.get("second_best") or {}
-        agg = comparisons.get("aggregate") or {}
-
-        def fmt_row(
+        def fmt_cmp_row(
             label: str,
-            exp: Any,
-            ratio: Dict[str, Any],
-            E_mean: Any,
-            E_min: Any,
-            head: Any,
+            exp: Optional[Any],
+            ratio: Optional[Dict[str, Any]],
+            E_mean: Optional[Any],
+            E_min: Optional[Any],
+            head_min: Optional[Any],
             extra: str = "",
         ) -> str:
-            exp_s = "—"
-            if exp is not None:
-                try:
-                    exp_s = f"{int(round(float(exp)))}s"
-                except Exception:
-                    exp_s = str(exp)
-            rline = _stable_ratio_line(dict(ratio or {})) or "—"
-            return (
-                f"  {label:<9} {exp_s:>5} | "
-                f"{rline} | "
-                f"E_mean {_fmt_float(E_mean, nd=3):>6} "
-                f"E_min {_fmt_float(E_min, nd=3):>6} "
-                f"head_min {_fmt_float(head, nd=3):>6}"
-                + (f" | {extra}" if extra else "")
+            exp_s = f"{int(round(float(exp)))}s" if exp is not None else "—"
+            ratio_s = _fmt_ratio_line(ratio or {}) if ratio else "—"
+            row = (
+                f"  {label:<9} {exp_s:>5} | {ratio_s}"
+                f" | E_mean {_fmt_float(E_mean, nd=3, width=6)}"
+                f" E_min {_fmt_float(E_min, nd=3, width=6)}"
+                f" head_min {_fmt_float(head_min, nd=3, width=6)}"
             )
+            if extra:
+                row += f" | {extra}"
+            return row
 
-        if best:
-            lines.append(
-                fmt_row(
-                    "BEST",
-                    best.get("exptime_s"),
-                    best.get("ratio_vs_ha"),
-                    best.get("E_mean"),
-                    best.get("E_min"),
-                    best.get("min_linear_headroom_p99"),
-                )
+        # BEST
+        lines.append(
+            fmt_cmp_row(
+                "BEST",
+                best.get("exptime_s"),
+                best.get("ratio_vs_ha"),
+                best.get("E_mean"),
+                best.get("E_min"),
+                best.get("headroom_min"),
             )
+        )
 
-        if second:
-            extra = ""
-            dvb = second.get("delta_vs_best")
-            if dvb is not None:
-                try:
-                    extra = f"Δscore {float(dvb):.3f}"
-                except Exception:
-                    extra = ""
+        # 2ND
+        if isinstance(second, dict) and second:
+            ds = second.get("delta_score")
+            extra = f"Δscore {_fmt_float(ds, nd=3)}" if ds is not None else ""
             lines.append(
-                fmt_row(
+                fmt_cmp_row(
                     "2ND",
                     second.get("exptime_s"),
                     second.get("ratio_vs_ha"),
                     second.get("E_mean"),
                     second.get("E_min"),
-                    second.get("min_linear_headroom_p99"),
+                    second.get("headroom_min"),
                     extra=extra,
                 )
             )
+        else:
+            lines.append("  2ND        — | —")
 
-        if agg:
-            extra = ""
-            exps_used = agg.get("exptimes_used") or []
-            if exps_used:
-                extra = "exps " + ",".join([str(x) for x in exps_used])
+        # AGGREGATE
+        if isinstance(agg, dict) and agg:
+            exps = agg.get("exposures_used") or agg.get("exposures") or []
+            exp_list: List[str] = []
+            for e in exps:
+                try:
+                    exp_list.append(str(int(round(float(e)))))
+                except Exception:
+                    exp_list.append(str(e))
+            exp_list_s = ",".join(exp_list) if exp_list else ""
+            extra = f"exps {exp_list_s}" if exp_list_s else ""
             lines.append(
-                fmt_row(
+                fmt_cmp_row(
                     "AGGREGATE",
-                    "—",
+                    None,
                     agg.get("ratio_vs_ha"),
                     agg.get("E_mean"),
                     agg.get("E_min"),
-                    agg.get("min_linear_headroom_p99"),
+                    agg.get("headroom_min"),
                     extra=extra,
                 )
             )
-            note = str(agg.get("note") or "").strip()
-            if note:
-                lines.append(f"    ↳ {note}")
+            lines.append(
+                "    ↳ Aggregate is averaged across all eligible exposures (stabilizes ratios when you only have 1 frame per filter per exposure)."
+            )
+        else:
+            lines.append("  AGGREGATE  — | —")
 
+        if used_src:
+            lines.append(f"    ↳ Recommended ratio source: {used_src}")
+
+        tw = warnings.get("transparency")
+        if isinstance(tw, str) and tw.strip():
+            lines.append(f"    ↳ Warning: {tw.strip()}")
+
+    # ----------------------------
+    # Candidates table
+    # ----------------------------
     lines.append("")
     lines.append("CANDIDATES")
-
-    # Column header
     lines.append("  exp   pick     score   E_mean  E_min   headroom_min  filters  note")
+
     for c in candidates:
         exp = c.get("exptime_s")
         exp_s = f"{int(exp):>3d}s" if isinstance(exp, int) else f"{str(exp):>4}"
@@ -480,11 +277,6 @@ def _build_report_text(payload: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-# -----------------------------
-# Main solve wrapper
-# -----------------------------
-
-
 def solve_session_and_optionally_close(
     *,
     db_path: str,
@@ -498,6 +290,7 @@ def solve_session_and_optionally_close(
     try:
         con.execute("PRAGMA foreign_keys = ON;")
 
+        # Engine is the single source of truth for metrics/ratios/scoring.
         result = solve_training_session(
             con,
             int(session_id),
@@ -517,6 +310,22 @@ def solve_session_and_optionally_close(
             close_call_delta_default=float(
                 getattr(cfg, "training_close_call_delta", 0.05)
             ),
+            # NEW defaults (1-3) - only used if engine supports them (it does in your current file)
+            sky_limited_target_ratio_default=float(
+                getattr(cfg, "training_sky_limited_target_ratio", 10.0)
+            ),
+            sky_limited_penalty_weight_default=float(
+                getattr(cfg, "training_sky_limited_penalty_weight", 0.08)
+            ),
+            transparency_variation_warn_frac_default=float(
+                getattr(cfg, "training_transparency_variation_warn_frac", 0.35)
+            ),
+            prefer_aggregate_ratio_when_unstable_default=bool(
+                getattr(cfg, "training_prefer_aggregate_ratio_when_unstable", True)
+            ),
+            aggregate_ratio_weight_mode_default=str(
+                getattr(cfg, "training_aggregate_ratio_weight_mode", "nebula_over_sky")
+            ),
         )
 
         if not result.get("ok"):
@@ -533,6 +342,7 @@ def solve_session_and_optionally_close(
         best = result.get("best") or {}
         exposure_report = result.get("exposure_report") or {}
         excluded = result.get("excluded") or {}
+        ratios = result.get("ratios") or {}
 
         recommended_exptime_s = best.get("recommended_exptime_s")
         ratio_vs_ha = best.get("ratio_vs_ha") or {}
@@ -546,7 +356,7 @@ def solve_session_and_optionally_close(
             )
             one_liner = f"{rx:.0f}s | {ratio_str}".strip()
 
-        # Build candidates list from exposure_report (already assembled by engine)
+        # Candidates list from exposure_report (engine-generated, no duplication)
         candidates: List[Dict[str, Any]] = []
         for exp_key in _sort_exposure_keys(list(exposure_report.keys())):
             rep = exposure_report.get(exp_key) or {}
@@ -569,8 +379,7 @@ def solve_session_and_optionally_close(
                 }
             )
 
-        # NEW: comparisons (best / 2nd / aggregate ratios)
-        comparisons = _build_comparisons_from_exposure_report(exposure_report)
+        ratio_used_source = best.get("ratio_source") or ratios.get("source_used")
 
         summary: Dict[str, Any] = {
             "session_id": int(session_id),
@@ -584,8 +393,10 @@ def solve_session_and_optionally_close(
                 "E_min": best.get("E_min"),
                 "frames_used": best.get("frames_used"),
                 "one_liner": one_liner,
+                "ratio_used_source": ratio_used_source,
             },
-            "comparisons": comparisons,
+            # Canonical: straight from engine
+            "ratios": ratios,
             "candidates": candidates,
         }
 

@@ -228,6 +228,23 @@ class AppConfig:
     # "score_weighted" = shifted score weights (stable even if scores negative)
     # "equal"         = every eligible exposure contributes equally
     training_ratio_weight_mode: str = "score_weighted"
+    # -----------------------------
+    # Training session scoring + ratio behavior (global defaults)
+    # -----------------------------
+
+    # (1) Sky-limited soft penalty:
+    # If avg sky_limited_ratio < target, apply a small score penalty.
+    training_sky_limited_target_ratio: float = 10.0
+    training_sky_limited_penalty_weight: float = 0.08
+
+    # (3) Transparency variation warning / ratio stabilisation:
+    # If transparency spread is high, ratios can jump around when you only have 1 frame/filter/exposure.
+    training_transparency_variation_warn_frac: float = 0.35
+    training_prefer_aggregate_ratio_when_unstable: bool = True
+
+    # (2) Aggregate ratio weighting:
+    # "nebula_over_sky" stabilises ratios using a brightness proxy; "uniform" averages exposures equally.
+    training_aggregate_ratio_weight_mode: str = "nebula_over_sky"
 
     def is_module_enabled(self, module_name: str) -> bool:
         return self.enabled_modules.get(module_name, False)

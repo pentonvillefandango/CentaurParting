@@ -6,7 +6,7 @@ import math
 import re
 import sqlite3
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple, Any, Iterable
+from typing import Dict, List, Optional, Sequence, Tuple, Any
 
 from centaur.logging import utc_now
 
@@ -22,6 +22,11 @@ class ExposureEval:
     score: float
     n_frames_used: int
     min_linear_headroom_p99: Optional[float]
+
+    # Optional context (may be None if missing in table)
+    avg_sky_limited_ratio: Optional[float]
+    avg_transparency_proxy: Optional[float]  # sky_ff_median_adu_s proxy
+    avg_nebula_over_sky: Optional[float]
 
 
 def _table_exists(con: sqlite3.Connection, name: str) -> bool:
@@ -69,6 +74,7 @@ def _safe_int(x: object) -> Optional[int]:
 def _compute_E(
     nebula_minus_bg_adu_s: float, sky_ff_median_adu_s: float
 ) -> Optional[float]:
+    # E proxy used for ratios/scoring: signal rate divided by sqrt(sky rate)
     if nebula_minus_bg_adu_s is None or sky_ff_median_adu_s is None:
         return None
     if sky_ff_median_adu_s <= 0:
@@ -152,31 +158,66 @@ def _candidate_exposures_from_dark_profile(
     return sorted(set(out))
 
 
+def _quantile(vals: List[float], q: float) -> Optional[float]:
+    if not vals:
+        return None
+    if q <= 0:
+        return min(vals)
+    if q >= 1:
+        return max(vals)
+    s = sorted(vals)
+    # simple linear interpolation
+    pos = (len(s) - 1) * q
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return float(s[lo])
+    frac = pos - lo
+    return float(s[lo] * (1 - frac) + s[hi] * frac)
+
+
 def _evaluate_exposure(
     con: sqlite3.Connection,
     sid: int,
     exptime_s: float,
     required_filters: Sequence[str],
     min_linear_headroom: float,
-) -> Tuple[Optional[Dict[str, float]], int, List[str], Optional[float]]:
+) -> Tuple[
+    Optional[Dict[str, float]],
+    int,
+    List[str],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+]:
     """
     Returns:
       - per_filter_E_avg (or None if excluded)
       - n_used
       - reasons (machine-readable)
       - min_linear_headroom_seen (min across frames that were td.usable=1)
+      - avg_sky_limited_ratio (avg across used frames)
+      - avg_transparency_proxy (avg across used frames)
+      - avg_nebula_over_sky (avg across used frames)
     """
     reasons: List[str] = []
 
+    # optional columns
     has_lh = _has_column(con, "training_derived_metrics", "linear_headroom_p99")
+    has_slr = _has_column(con, "training_derived_metrics", "sky_limited_ratio")
+    has_tp = _has_column(con, "training_derived_metrics", "transparency_proxy")
+    has_nos = _has_column(con, "training_derived_metrics", "nebula_over_sky")
 
-    cols = [
-        "td.filter",
-        "td.nebula_minus_bg_adu_s",
-        "td.sky_ff_median_adu_s",
-    ]
+    cols = ["td.filter", "td.nebula_minus_bg_adu_s", "td.sky_ff_median_adu_s"]
     if has_lh:
         cols.append("td.linear_headroom_p99")
+    if has_slr:
+        cols.append("td.sky_limited_ratio")
+    if has_tp:
+        cols.append("td.transparency_proxy")
+    if has_nos:
+        cols.append("td.nebula_over_sky")
 
     rows = con.execute(
         f"""
@@ -198,6 +239,26 @@ def _evaluate_exposure(
     n_headroom_reject = 0
     min_lh_seen: Optional[float] = None
 
+    slr_vals: List[float] = []
+    tp_vals: List[float] = []
+    nos_vals: List[float] = []
+
+    # Determine indices for optional columns
+    idx = 3  # after filter, neb, sky
+    idx_lh = idx_slr = idx_tp = idx_nos = None
+    if has_lh:
+        idx_lh = idx
+        idx += 1
+    if has_slr:
+        idx_slr = idx
+        idx += 1
+    if has_tp:
+        idx_tp = idx
+        idx += 1
+    if has_nos:
+        idx_nos = idx
+        idx += 1
+
     for row in rows:
         f = str(row[0]).strip().upper()
         if f not in per_filter_vals:
@@ -208,8 +269,8 @@ def _evaluate_exposure(
         if neb is None or sky is None:
             continue
 
-        if has_lh:
-            lh = _safe_float(row[3])
+        if idx_lh is not None:
+            lh = _safe_float(row[idx_lh])
             if lh is not None:
                 min_lh_seen = (
                     lh if (min_lh_seen is None or lh < min_lh_seen) else min_lh_seen
@@ -225,6 +286,21 @@ def _evaluate_exposure(
         per_filter_vals[f].append(E)
         n_used += 1
 
+        if idx_slr is not None:
+            v = _safe_float(row[idx_slr])
+            if v is not None:
+                slr_vals.append(v)
+
+        if idx_tp is not None:
+            v = _safe_float(row[idx_tp])
+            if v is not None:
+                tp_vals.append(v)
+
+        if idx_nos is not None:
+            v = _safe_float(row[idx_nos])
+            if v is not None:
+                nos_vals.append(v)
+
     missing = [f for f in required_filters if len(per_filter_vals[f.upper()]) == 0]
     if missing:
         reasons.append(f"missing_filters:{','.join([m.upper() for m in missing])}")
@@ -236,14 +312,30 @@ def _evaluate_exposure(
         reasons.append(f"rejected_by_linear_headroom:{n_headroom_reject}")
 
     if reasons:
-        return None, n_used, reasons, min_lh_seen
+        return (
+            None,
+            n_used,
+            reasons,
+            min_lh_seen,
+            ((sum(slr_vals) / len(slr_vals)) if slr_vals else None),
+            ((sum(tp_vals) / len(tp_vals)) if tp_vals else None),
+            ((sum(nos_vals) / len(nos_vals)) if nos_vals else None),
+        )
 
     per_filter_E_avg: Dict[str, float] = {}
     for f in required_filters:
         vals = per_filter_vals[f.upper()]
         per_filter_E_avg[f.upper()] = sum(vals) / float(len(vals))
 
-    return per_filter_E_avg, n_used, [], min_lh_seen
+    return (
+        per_filter_E_avg,
+        n_used,
+        [],
+        min_lh_seen,
+        (sum(slr_vals) / len(slr_vals)) if slr_vals else None,
+        (sum(tp_vals) / len(tp_vals)) if tp_vals else None,
+        (sum(nos_vals) / len(nos_vals)) if nos_vals else None,
+    )
 
 
 def _score_exposure(
@@ -255,7 +347,15 @@ def _score_exposure(
     w_min: float,
     short_penalty: float,
     long_penalty: float,
-) -> Tuple[float, float, float, float, float]:
+    *,
+    # (1) sky-limited soft penalty knobs
+    avg_sky_limited_ratio: Optional[float],
+    sky_limited_target_ratio: float,
+    sky_limited_penalty_weight: float,
+) -> Tuple[float, float, float, float, float, float]:
+    """
+    Returns: (score, E_mean, E_min, short_pen, long_pen, sky_pen)
+    """
     Es = list(per_filter_E.values())
     E_mean = sum(Es) / float(len(Es))
     E_min = min(Es)
@@ -263,8 +363,24 @@ def _score_exposure(
     sp = short_penalty * (min_exp / exptime_s) if exptime_s > 0 else 1e9
     lp = long_penalty * (exptime_s / max_exp) if max_exp > 0 else 0.0
 
-    score = (w_mean * E_mean) + (w_min * E_min) - sp - lp
-    return score, E_mean, E_min, sp, lp
+    # sky penalty: if sky_limited_ratio < target, penalize proportionally
+    sky_pen = 0.0
+    if (
+        sky_limited_penalty_weight is not None
+        and sky_limited_penalty_weight > 0
+        and avg_sky_limited_ratio is not None
+        and sky_limited_target_ratio is not None
+        and sky_limited_target_ratio > 0
+    ):
+        r = float(avg_sky_limited_ratio)
+        tgt = float(sky_limited_target_ratio)
+        if r < tgt:
+            # 0 at r=tgt, ramps to 1 at r=0
+            frac = max(0.0, min(1.0, (tgt - r) / tgt))
+            sky_pen = float(sky_limited_penalty_weight) * frac
+
+    score = (w_mean * E_mean) + (w_min * E_min) - sp - lp - sky_pen
+    return score, E_mean, E_min, sp, lp, sky_pen
 
 
 def _equal_snr_time_fractions(per_filter_E: Dict[str, float]) -> Dict[str, float]:
@@ -277,69 +393,6 @@ def _equal_snr_time_fractions(per_filter_E: Dict[str, float]) -> Dict[str, float
         n = len(weights) or 1
         return {f: 1.0 / n for f in weights}
     return {f: w / s for f, w in weights.items()}
-
-
-def _ratio_vs_ha_from_time_fractions(
-    required_filters: Sequence[str],
-    time_fractions: Dict[str, float],
-) -> Dict[str, float]:
-    ref = (
-        "HA"
-        if "HA" in time_fractions
-        else (list(time_fractions.keys())[0] if time_fractions else "HA")
-    )
-    ref_frac = time_fractions.get(ref, 1.0) or 1.0
-    out: Dict[str, float] = {}
-    for f in required_filters:
-        fu = str(f).upper()
-        out[fu] = (time_fractions.get(fu, 0.0) / ref_frac) if ref_frac > 0 else 0.0
-    return out
-
-
-def _aggregate_per_filter_E(
-    evals: List[ExposureEval],
-    required_filters: Sequence[str],
-    *,
-    weight_mode: str = "score_weighted",
-) -> Optional[Dict[str, float]]:
-    """
-    Aggregate per-filter E across exposures to stabilize ratios when you have
-    1 frame per filter per exposure.
-
-    weight_mode:
-      - "score_weighted": weight by shifted score (always positive)
-      - "equal": equal weight
-    """
-    if not evals:
-        return None
-
-    # Only use evals that have all required filters (by construction they do)
-    # Ensure stable weights even if scores are negative.
-    scores = [float(e.score) for e in evals]
-    min_s = min(scores)
-    # shift so smallest score still gets a small positive weight
-    eps = 1e-6
-
-    def w_for(e: ExposureEval) -> float:
-        if weight_mode == "equal":
-            return 1.0
-        # score_weighted (default)
-        return max(float(e.score) - min_s + eps, eps)
-
-    numer: Dict[str, float] = {str(f).upper(): 0.0 for f in required_filters}
-    denom: float = 0.0
-
-    for e in evals:
-        w = w_for(e)
-        denom += w
-        for f in required_filters:
-            fu = str(f).upper()
-            numer[fu] += w * float(e.per_filter_E.get(fu, 0.0))
-
-    if denom <= 0:
-        return None
-
-    return {fu: numer[fu] / denom for fu in numer.keys()}
 
 
 def _plain_reason_not_chosen(
@@ -449,9 +502,12 @@ def solve_training_session(
     long_penalty_default: float,
     include_excluded_default: bool = True,
     close_call_delta_default: float = 0.05,
-    # Ratio recommendation strategy defaults (config), can be overridden by session params_json.
-    ratio_strategy_default: str = "aggregate_weighted",  # best | second | aggregate_weighted | aggregate_equal
-    ratio_weight_mode_default: str = "score_weighted",  # score_weighted | equal
+    # NEW defaults (1-3)
+    sky_limited_target_ratio_default: float = 10.0,
+    sky_limited_penalty_weight_default: float = 0.08,
+    transparency_variation_warn_frac_default: float = 0.35,
+    prefer_aggregate_ratio_when_unstable_default: bool = True,
+    aggregate_ratio_weight_mode_default: str = "nebula_over_sky",  # or "uniform"
 ) -> Dict[str, object]:
     """
     Computes recommendation and writes a training_session_results row.
@@ -467,7 +523,9 @@ def solve_training_session(
     sess = fetch_training_session(con, sid)
     params = parse_params_json(sess)
 
-    # Session overrides (Option C behavior)
+    # -----------------------------
+    # Session overrides (Option C)
+    # -----------------------------
     required_filters = params.get("required_filters") or list(required_filters_default)
     required_filters = [
         str(f).strip().upper() for f in required_filters if str(f).strip()
@@ -505,23 +563,45 @@ def solve_training_session(
     if close_call_delta is None:
         close_call_delta = float(close_call_delta_default)
 
-    ratio_strategy = (
-        str(params.get("ratio_strategy") or ratio_strategy_default).strip().lower()
+    # NEW (1-3) overrides
+    sky_limited_target_ratio = _safe_float(params.get("sky_limited_target_ratio"))
+    if sky_limited_target_ratio is None:
+        sky_limited_target_ratio = float(sky_limited_target_ratio_default)
+
+    sky_limited_penalty_weight = _safe_float(params.get("sky_limited_penalty_weight"))
+    if sky_limited_penalty_weight is None:
+        sky_limited_penalty_weight = float(sky_limited_penalty_weight_default)
+
+    transparency_variation_warn_frac = _safe_float(
+        params.get("transparency_variation_warn_frac")
     )
-    ratio_weight_mode = (
-        str(params.get("ratio_weight_mode") or ratio_weight_mode_default)
+    if transparency_variation_warn_frac is None:
+        transparency_variation_warn_frac = float(
+            transparency_variation_warn_frac_default
+        )
+
+    prefer_aggregate_ratio_when_unstable = params.get(
+        "prefer_aggregate_ratio_when_unstable"
+    )
+    if prefer_aggregate_ratio_when_unstable is None:
+        prefer_aggregate_ratio_when_unstable = bool(
+            prefer_aggregate_ratio_when_unstable_default
+        )
+    else:
+        prefer_aggregate_ratio_when_unstable = bool(
+            prefer_aggregate_ratio_when_unstable
+        )
+
+    aggregate_ratio_weight_mode = (
+        str(
+            params.get("aggregate_ratio_weight_mode")
+            or aggregate_ratio_weight_mode_default
+        )
         .strip()
         .lower()
     )
-    if ratio_strategy not in {
-        "best",
-        "second",
-        "aggregate_weighted",
-        "aggregate_equal",
-    }:
-        ratio_strategy = "aggregate_weighted"
-    if ratio_weight_mode not in {"score_weighted", "equal"}:
-        ratio_weight_mode = "score_weighted"
+    if aggregate_ratio_weight_mode not in ("nebula_over_sky", "uniform"):
+        aggregate_ratio_weight_mode = "nebula_over_sky"
 
     constraints: Dict[str, object] = {
         "required_filters": list(required_filters),
@@ -532,8 +612,17 @@ def solve_training_session(
             "short_penalty": float(short_penalty),
             "long_penalty": float(long_penalty),
         },
-        "ratio_strategy": ratio_strategy,
-        "ratio_weight_mode": ratio_weight_mode,
+        "sky_limited": {
+            "target_ratio": float(sky_limited_target_ratio),
+            "penalty_weight": float(sky_limited_penalty_weight),
+        },
+        "transparency": {
+            "warn_frac": float(transparency_variation_warn_frac),
+            "prefer_aggregate_ratio_when_unstable": bool(
+                prefer_aggregate_ratio_when_unstable
+            ),
+        },
+        "aggregate_ratio_weight_mode": aggregate_ratio_weight_mode,
     }
 
     # Candidate exposures: dark profile list first (if available), else session frames
@@ -571,10 +660,23 @@ def solve_training_session(
 
     evals: List[ExposureEval] = []
     excluded: Dict[str, List[str]] = {}
+
+    # full per-exposure report (even excluded)
     exposure_report: Dict[str, Dict[str, object]] = {}
 
+    # Keep per-exposure penalty breakdowns (useful for debugging/report)
+    penalty_report: Dict[str, Dict[str, float]] = {}
+
     for exp in candidates:
-        per_filter_E, n_used, reasons, min_lh_seen = _evaluate_exposure(
+        (
+            per_filter_E,
+            n_used,
+            reasons,
+            min_lh_seen,
+            avg_slr,
+            avg_tp,
+            avg_nos,
+        ) = _evaluate_exposure(
             con,
             sid=sid,
             exptime_s=exp,
@@ -602,10 +704,13 @@ def solve_training_session(
                     close_call_delta=float(close_call_delta),
                 ),
                 "excluded_reasons": reasons,
+                "avg_sky_limited_ratio": avg_slr,
+                "avg_transparency_proxy": avg_tp,
+                "avg_nebula_over_sky": avg_nos,
             }
             continue
 
-        score, E_mean, E_min, sp, lp = _score_exposure(
+        score, E_mean, E_min, sp, lp, sky_pen = _score_exposure(
             exp,
             per_filter_E,
             min_exp=min_exp,
@@ -614,6 +719,9 @@ def solve_training_session(
             w_min=float(w_min),
             short_penalty=float(short_penalty),
             long_penalty=float(long_penalty),
+            avg_sky_limited_ratio=avg_slr,
+            sky_limited_target_ratio=float(sky_limited_target_ratio),
+            sky_limited_penalty_weight=float(sky_limited_penalty_weight),
         )
 
         evals.append(
@@ -625,8 +733,17 @@ def solve_training_session(
                 score=score,
                 n_frames_used=n_used,
                 min_linear_headroom_p99=min_lh_seen,
+                avg_sky_limited_ratio=avg_slr,
+                avg_transparency_proxy=avg_tp,
+                avg_nebula_over_sky=avg_nos,
             )
         )
+
+        penalty_report[exp_key] = {
+            "short": float(sp),
+            "long": float(lp),
+            "sky_limited": float(sky_pen),
+        }
 
         exposure_report[exp_key] = {
             "filters": list(required_filters),
@@ -639,8 +756,15 @@ def solve_training_session(
             "frames_used": int(n_used),
             "chosen": False,
             "reason": "",
-            "penalties": {"short": float(sp), "long": float(lp)},
+            "penalties": {
+                "short": float(sp),
+                "long": float(lp),
+                "sky_limited": float(sky_pen),
+            },
             "E_per_filter": {k: float(v) for k, v in per_filter_E.items()},
+            "avg_sky_limited_ratio": (float(avg_slr) if avg_slr is not None else None),
+            "avg_transparency_proxy": (float(avg_tp) if avg_tp is not None else None),
+            "avg_nebula_over_sky": (float(avg_nos) if avg_nos is not None else None),
         }
 
     if not evals:
@@ -659,10 +783,12 @@ def solve_training_session(
 
     evals.sort(key=lambda e: e.score, reverse=True)
     best = evals[0]
-    second: Optional[ExposureEval] = evals[1] if len(evals) >= 2 else None
+    second = evals[1] if len(evals) >= 2 else None
 
     best_key = f"{best.exptime_s:.0f}"
+    second_key = f"{second.exptime_s:.0f}" if second is not None else None
 
+    # mark chosen + fill reasons for non-chosen scored candidates
     for exp_key, rep in exposure_report.items():
         if exp_key == best_key:
             rep["chosen"] = True
@@ -677,60 +803,119 @@ def solve_training_session(
                     close_call_delta=float(close_call_delta),
                 )
 
-    # ---------------------------
-    # RATIO COMPARISON
-    # ---------------------------
-    best_tf = _equal_snr_time_fractions(best.per_filter_E)
-    best_ratio = _ratio_vs_ha_from_time_fractions(required_filters, best_tf)
+    # -----------------------------
+    # Ratios:
+    #  - best-only
+    #  - second-best
+    #  - (2) aggregate weighted across all eligible exposures
+    # -----------------------------
+    def ratios_from_per_filter_E(
+        per_filter_E: Dict[str, float],
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        tf = _equal_snr_time_fractions(per_filter_E)
+        ref = "HA" if "HA" in tf else list(tf.keys())[0]
+        ref_frac = tf.get(ref, 1.0) or 1.0
+        r = {
+            f.upper(): (tf.get(f.upper(), 0.0) / ref_frac if ref_frac > 0 else 0.0)
+            for f in required_filters
+        }
+        return tf, r
+
+    best_tf, best_ratio = ratios_from_per_filter_E(best.per_filter_E)
 
     second_tf: Optional[Dict[str, float]] = None
     second_ratio: Optional[Dict[str, float]] = None
-    second_delta_score: Optional[float] = None
     if second is not None:
-        second_tf = _equal_snr_time_fractions(second.per_filter_E)
-        second_ratio = _ratio_vs_ha_from_time_fractions(required_filters, second_tf)
-        second_delta_score = float(best.score - second.score)
+        second_tf, second_ratio = ratios_from_per_filter_E(second.per_filter_E)
 
-    agg_weight_mode = (
-        "equal" if ratio_strategy == "aggregate_equal" else ratio_weight_mode
+    # Aggregate per_filter_E (weighted)
+    agg_num: Dict[str, float] = {f.upper(): 0.0 for f in required_filters}
+    agg_den: float = 0.0
+
+    agg_used_exps: List[int] = []
+    for e in evals:
+        # decide weight
+        w = 1.0
+        if aggregate_ratio_weight_mode == "nebula_over_sky":
+            # prefer a conservative weight: use min across filters if present
+            if e.avg_nebula_over_sky is not None:
+                w = float(e.avg_nebula_over_sky)
+            else:
+                w = 1.0
+            # keep sane
+            if not math.isfinite(w) or w <= 0:
+                w = 1.0
+
+        for f in required_filters:
+            agg_num[f.upper()] += w * float(e.per_filter_E.get(f.upper(), 0.0))
+        agg_den += w
+        agg_used_exps.append(int(round(float(e.exptime_s))))
+
+    if agg_den <= 0:
+        # fallback uniform mean if something went weird
+        agg_den = float(len(evals))
+        for f in required_filters:
+            agg_num[f.upper()] = sum(
+                float(e.per_filter_E.get(f.upper(), 0.0)) for e in evals
+            )
+
+    agg_per_filter_E = {
+        f.upper(): (agg_num[f.upper()] / agg_den) for f in required_filters
+    }
+    agg_tf, agg_ratio = ratios_from_per_filter_E(agg_per_filter_E)
+
+    # Aggregate summary metrics for reporting
+    agg_Es = list(agg_per_filter_E.values()) or [0.0]
+    agg_E_mean = sum(agg_Es) / float(len(agg_Es))
+    agg_E_min = min(agg_Es)
+    agg_head_min = min(
+        [
+            e.min_linear_headroom_p99
+            for e in evals
+            if e.min_linear_headroom_p99 is not None
+        ],
+        default=None,
     )
-    agg_per_filter_E = _aggregate_per_filter_E(
-        evals, required_filters, weight_mode=agg_weight_mode
-    )
-    agg_tf: Optional[Dict[str, float]] = None
-    agg_ratio: Optional[Dict[str, float]] = None
-    if agg_per_filter_E is not None:
-        agg_tf = _equal_snr_time_fractions(agg_per_filter_E)
-        agg_ratio = _ratio_vs_ha_from_time_fractions(required_filters, agg_tf)
 
-    # Choose the ratio that will be *recommended*
-    used_ratio_source = ratio_strategy
-    used_tf: Dict[str, float]
-    used_ratio: Dict[str, float]
-    if ratio_strategy == "best":
-        used_tf = best_tf
-        used_ratio = best_ratio
-    elif (
-        ratio_strategy == "second"
-        and second_tf is not None
-        and second_ratio is not None
-    ):
-        used_tf = second_tf
-        used_ratio = second_ratio
-    else:
-        # aggregate_* (preferred)
-        if agg_tf is not None and agg_ratio is not None:
-            used_tf = agg_tf
-            used_ratio = agg_ratio
-        else:
-            # fallback safety
-            used_ratio_source = "best(fallback)"
-            used_tf = best_tf
-            used_ratio = best_ratio
+    # -----------------------------
+    # (3) Transparency variation detection
+    # -----------------------------
+    tp_vals = [
+        e.avg_transparency_proxy for e in evals if e.avg_transparency_proxy is not None
+    ]
+    transparency_warning: Optional[str] = None
+    transparency_stats: Dict[str, Any] = {}
 
-    # ---------------------------
-    # Write result + return
-    # ---------------------------
+    if len(tp_vals) >= 2:
+        p10 = _quantile(tp_vals, 0.10)
+        p50 = _quantile(tp_vals, 0.50)
+        p90 = _quantile(tp_vals, 0.90)
+        if p10 is not None and p50 is not None and p90 is not None and p50 > 0:
+            spread_frac = float(p90 - p10) / float(p50)
+            transparency_stats = {
+                "p10": float(p10),
+                "p50": float(p50),
+                "p90": float(p90),
+                "spread_frac": float(spread_frac),
+            }
+            if spread_frac >= float(transparency_variation_warn_frac):
+                transparency_warning = (
+                    f"Sky conditions varied across exposures (transparency spread ~{spread_frac:.2f} of median). "
+                    f"Ratios may be unstable; aggregate ratio recommended."
+                )
+
+    # Decide which ratio to return as the primary "recommended ratio"
+    ratio_source = "best"
+    recommended_tf = best_tf
+    recommended_ratio = best_ratio
+    if transparency_warning and prefer_aggregate_ratio_when_unstable:
+        ratio_source = "aggregate"
+        recommended_tf = agg_tf
+        recommended_ratio = agg_ratio
+
+    # -----------------------------
+    # Build stats for DB + reporting
+    # -----------------------------
     stats: Dict[str, object] = {
         "required_filters": list(required_filters),
         "recommended_exptime_s": float(best.exptime_s),
@@ -752,16 +937,32 @@ def solve_training_session(
                     if e.min_linear_headroom_p99 is not None
                     else None
                 ),
+                "avg_sky_limited_ratio": (
+                    float(e.avg_sky_limited_ratio)
+                    if e.avg_sky_limited_ratio is not None
+                    else None
+                ),
+                "avg_transparency_proxy": (
+                    float(e.avg_transparency_proxy)
+                    if e.avg_transparency_proxy is not None
+                    else None
+                ),
+                "avg_nebula_over_sky": (
+                    float(e.avg_nebula_over_sky)
+                    if e.avg_nebula_over_sky is not None
+                    else None
+                ),
             }
             for e in evals
         ],
         "exposure_report": exposure_report,
-        "ratio_comparison": {
-            "used_ratio_source": used_ratio_source,
+        "penalty_report": penalty_report,
+        "ratios": {
+            "source_used": ratio_source,
             "best": {
                 "exptime_s": float(best.exptime_s),
-                "ratio_vs_ha": best_ratio,
                 "time_fractions": best_tf,
+                "ratio_vs_ha": best_ratio,
                 "E_mean": float(best.E_mean),
                 "E_min": float(best.E_min),
                 "headroom_min": (
@@ -774,8 +975,8 @@ def solve_training_session(
             "second": (
                 {
                     "exptime_s": float(second.exptime_s),
-                    "ratio_vs_ha": second_ratio,
                     "time_fractions": second_tf,
+                    "ratio_vs_ha": second_ratio,
                     "E_mean": float(second.E_mean),
                     "E_min": float(second.E_min),
                     "headroom_min": (
@@ -784,49 +985,32 @@ def solve_training_session(
                         else None
                     ),
                     "score": float(second.score),
-                    "delta_score": (
-                        float(second_delta_score)
-                        if second_delta_score is not None
-                        else None
-                    ),
+                    "delta_score": float(best.score - second.score),
                 }
                 if second is not None
-                and second_ratio is not None
                 and second_tf is not None
+                and second_ratio is not None
                 else None
             ),
-            "aggregate": (
-                {
-                    "ratio_vs_ha": agg_ratio,
-                    "time_fractions": agg_tf,
-                    "E_per_filter": agg_per_filter_E,
-                    "weight_mode": agg_weight_mode,
-                    "n_exposures": int(len(evals)),
-                    "exposures": [float(e.exptime_s) for e in evals],
-                    # headroom_min across eligible exps (use min of mins)
-                    "headroom_min": (
-                        float(
-                            min(
-                                [
-                                    e.min_linear_headroom_p99
-                                    for e in evals
-                                    if e.min_linear_headroom_p99 is not None
-                                ]
-                            )
-                        )
-                        if any(e.min_linear_headroom_p99 is not None for e in evals)
-                        else None
-                    ),
-                    "E_mean": float(sum([e.E_mean for e in evals]) / len(evals)),
-                    "E_min": float(min([e.E_min for e in evals])),
-                }
-                if agg_ratio is not None
-                and agg_tf is not None
-                and agg_per_filter_E is not None
-                else None
-            ),
+            "aggregate": {
+                "exptime_s": None,
+                "time_fractions": agg_tf,
+                "ratio_vs_ha": agg_ratio,
+                "E_mean": float(agg_E_mean),
+                "E_min": float(agg_E_min),
+                "headroom_min": (
+                    float(agg_head_min) if agg_head_min is not None else None
+                ),
+                "exposures_used": sorted(set(agg_used_exps)),
+                "weight_mode": aggregate_ratio_weight_mode,
+            },
+            "warnings": {
+                "transparency": transparency_warning,
+                "transparency_stats": transparency_stats,
+            },
         },
     }
+
     if include_excluded:
         stats["excluded_candidates"] = excluded
 
@@ -837,8 +1021,8 @@ def solve_training_session(
         message="ok",
         recommended_exptime_s=best.exptime_s,
         recommended_filters=required_filters,
-        recommended_time_fractions=used_tf,
-        recommended_ratio_vs_ha=used_ratio,
+        recommended_time_fractions=recommended_tf,
+        recommended_ratio_vs_ha=recommended_ratio,
         constraints=constraints,
         conditions={},
         stats=stats,
@@ -848,19 +1032,19 @@ def solve_training_session(
         "ok": True,
         "best": {
             "recommended_exptime_s": float(best.exptime_s),
-            "time_fractions": used_tf,
-            "ratio_vs_ha": used_ratio,
+            "time_fractions": recommended_tf,  # may be best OR aggregate depending on stability
+            "ratio_vs_ha": recommended_ratio,  # may be best OR aggregate depending on stability
+            "ratio_source": ratio_source,
             "score": float(best.score),
             "E_mean": float(best.E_mean),
             "E_min": float(best.E_min),
             "frames_used": int(best.n_frames_used),
             "E_per_filter": {k: float(v) for k, v in best.per_filter_E.items()},
-            "ratio_used_source": used_ratio_source,
         },
         "excluded": excluded,
         "exposure_report": exposure_report,
         "candidates_scored": [float(e.exptime_s) for e in evals],
-        "ratio_comparison": stats["ratio_comparison"],
+        "ratios": stats["ratios"],
         "session": {
             "training_session_id": int(sess["training_session_id"]),
             "target_name": sess["target_name"] or "",
