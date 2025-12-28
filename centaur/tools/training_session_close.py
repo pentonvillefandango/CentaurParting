@@ -220,6 +220,11 @@ def _build_report_text(payload: Dict[str, Any]) -> str:
         if isinstance(tw, str) and tw.strip():
             lines.append(f"    ↳ Warning: {tw.strip()}")
 
+        # NEW (stage 5): ratio stability warning
+        rs = warnings.get("ratio_stability")
+        if isinstance(rs, str) and rs.strip():
+            lines.append(f"    ↳ Warning: {rs.strip()}")
+
     # ----------------------------
     # Candidates table
     # ----------------------------
@@ -325,6 +330,16 @@ def solve_session_and_optionally_close(
             ),
             aggregate_ratio_weight_mode_default=str(
                 getattr(cfg, "training_aggregate_ratio_weight_mode", "nebula_over_sky")
+            ),
+            # NEW defaults (4-5)
+            ratio_include_headroom_rejected_default=bool(
+                getattr(cfg, "training_ratio_include_headroom_rejected", True)
+            ),
+            ratio_min_samples_per_filter_default=int(
+                getattr(cfg, "training_ratio_min_samples_per_filter", 2)
+            ),
+            ratio_variation_warn_cv_default=float(
+                getattr(cfg, "training_ratio_variation_warn_cv", 0.40)
             ),
         )
 
