@@ -197,6 +197,86 @@ def _stdev(vals: List[float]) -> Optional[float]:
     return float(math.sqrt(v))
 
 
+# -----------------------------
+# Stage 4–5 add-ons: weighted robust aggregation helpers
+# -----------------------------
+def _weighted_quantile(
+    values: List[float], weights: List[float], q: float
+) -> Optional[float]:
+    if not values or not weights or len(values) != len(weights):
+        return None
+    pairs = []
+    for v, w in zip(values, weights):
+        try:
+            vv = float(v)
+            ww = float(w)
+        except Exception:
+            continue
+        if not (math.isfinite(vv) and math.isfinite(ww)) or ww <= 0:
+            continue
+        pairs.append((vv, ww))
+    if not pairs:
+        return None
+    pairs.sort(key=lambda x: x[0])
+    total = sum(w for _v, w in pairs)
+    if total <= 0:
+        return None
+    if q <= 0:
+        return pairs[0][0]
+    if q >= 1:
+        return pairs[-1][0]
+    target = q * total
+    c = 0.0
+    for v, w in pairs:
+        c += w
+        if c >= target:
+            return v
+    return pairs[-1][0]
+
+
+def _weighted_mean(values: List[float], weights: List[float]) -> Optional[float]:
+    if not values or not weights or len(values) != len(weights):
+        return None
+    num = 0.0
+    den = 0.0
+    for v, w in zip(values, weights):
+        try:
+            vv = float(v)
+            ww = float(w)
+        except Exception:
+            continue
+        if not (math.isfinite(vv) and math.isfinite(ww)) or ww <= 0:
+            continue
+        num += vv * ww
+        den += ww
+    if den <= 0:
+        return None
+    return num / den
+
+
+def _weighted_winsorized_mean(
+    values: List[float], weights: List[float], *, lo_q: float, hi_q: float
+) -> Optional[float]:
+    lo = _weighted_quantile(values, weights, lo_q)
+    hi = _weighted_quantile(values, weights, hi_q)
+    if lo is None or hi is None:
+        return _weighted_mean(values, weights)
+    clipped: List[float] = []
+    w2: List[float] = []
+    for v, w in zip(values, weights):
+        try:
+            vv = float(v)
+            ww = float(w)
+        except Exception:
+            continue
+        if not (math.isfinite(vv) and math.isfinite(ww)) or ww <= 0:
+            continue
+        vv = min(max(vv, float(lo)), float(hi))
+        clipped.append(vv)
+        w2.append(ww)
+    return _weighted_mean(clipped, w2)
+
+
 def _evaluate_exposure(
     con: sqlite3.Connection,
     sid: int,
@@ -262,15 +342,13 @@ def _evaluate_exposure(
     n_used_ratio = 0
     n_headroom_reject = 0
 
-    # min LH seen among all usable rows (even rejected)
     min_lh_seen: Optional[float] = None
 
     slr_vals: List[float] = []
     tp_vals: List[float] = []
     nos_vals: List[float] = []
 
-    # Determine indices for optional columns
-    idx = 3  # after filter, neb, sky
+    idx = 3
     idx_lh = idx_slr = idx_tp = idx_nos = None
     if has_lh:
         idx_lh = idx
@@ -307,12 +385,12 @@ def _evaluate_exposure(
         if E is None:
             continue
 
-        # Ratio path (Stage 4): include even if headroom fails (if enabled)
+        # Ratio path: may include headroom-rejected frames
         if ratio_include_headroom_rejected or lh is None or lh >= min_linear_headroom:
             per_filter_vals_ratio[f].append(E)
             n_used_ratio += 1
 
-        # Scoring path: still respects headroom
+        # Scoring path: respects headroom
         if lh is not None and lh < min_linear_headroom:
             n_headroom_reject += 1
             continue
@@ -347,7 +425,6 @@ def _evaluate_exposure(
     if n_headroom_reject > 0:
         reasons.append(f"rejected_by_linear_headroom:{n_headroom_reject}")
 
-    # Ratio dict can be computed even when scoring fails, but we only use ratios from eligible exposures later.
     per_filter_E_avg_ratio: Optional[Dict[str, float]] = None
     missing_ratio = [
         f for f in required_filters if len(per_filter_vals_ratio[f.upper()]) == 0
@@ -500,6 +577,7 @@ def write_training_result(
             training_session_id,
             computed_utc,
             status,
+
             message,
             recommended_exptime_s,
             recommended_filters_json,
@@ -564,6 +642,10 @@ def solve_training_session(
     ratio_include_headroom_rejected_default: bool = True,
     ratio_min_samples_per_filter_default: int = 2,
     ratio_variation_warn_cv_default: float = 0.40,
+    # NEW: robust aggregate controls (stages 4–5 enhancement)
+    aggregate_ratio_method_default: str = "winsor",  # mean|median|winsor
+    aggregate_ratio_winsor_q_default: float = 0.15,  # winsor clamp [q, 1-q]
+    aggregate_transparency_weight_clamp_default: float = 4.0,  # clamp tp weight factor
 ) -> Dict[str, object]:
     if not _table_exists(con, "training_session_frames"):
         raise RuntimeError("training_session_frames table missing")
@@ -648,7 +730,13 @@ def solve_training_session(
         .strip()
         .lower()
     )
-    if aggregate_ratio_weight_mode not in ("nebula_over_sky", "uniform"):
+    # EDIT: allow more modes
+    if aggregate_ratio_weight_mode not in (
+        "nebula_over_sky",
+        "uniform",
+        "inverse_transparency",
+        "combined",
+    ):
         aggregate_ratio_weight_mode = "nebula_over_sky"
 
     # Stage 4–5 overrides
@@ -666,6 +754,31 @@ def solve_training_session(
     ratio_variation_warn_cv = _safe_float(params.get("ratio_variation_warn_cv"))
     if ratio_variation_warn_cv is None:
         ratio_variation_warn_cv = float(ratio_variation_warn_cv_default)
+
+    # NEW: robust aggregate overrides
+    aggregate_ratio_method = (
+        str(params.get("aggregate_ratio_method") or aggregate_ratio_method_default)
+        .strip()
+        .lower()
+    )
+    if aggregate_ratio_method not in ("mean", "median", "winsor"):
+        aggregate_ratio_method = "winsor"
+
+    aggregate_ratio_winsor_q = _safe_float(params.get("aggregate_ratio_winsor_q"))
+    if aggregate_ratio_winsor_q is None:
+        aggregate_ratio_winsor_q = float(aggregate_ratio_winsor_q_default)
+    aggregate_ratio_winsor_q = max(0.0, min(0.49, float(aggregate_ratio_winsor_q)))
+
+    aggregate_transparency_weight_clamp = _safe_float(
+        params.get("aggregate_transparency_weight_clamp")
+    )
+    if aggregate_transparency_weight_clamp is None:
+        aggregate_transparency_weight_clamp = float(
+            aggregate_transparency_weight_clamp_default
+        )
+    aggregate_transparency_weight_clamp = max(
+        1.0, float(aggregate_transparency_weight_clamp)
+    )
 
     constraints: Dict[str, object] = {
         "required_filters": list(required_filters),
@@ -686,7 +799,15 @@ def solve_training_session(
                 prefer_aggregate_ratio_when_unstable
             ),
         },
+        # EDIT: keep old key for backward familiarity
         "aggregate_ratio_weight_mode": aggregate_ratio_weight_mode,
+        # NEW: structured aggregate info
+        "aggregate_ratio": {
+            "weight_mode": aggregate_ratio_weight_mode,
+            "method": aggregate_ratio_method,
+            "winsor_q": float(aggregate_ratio_winsor_q),
+            "transparency_weight_clamp": float(aggregate_transparency_weight_clamp),
+        },
         "ratio": {
             "include_headroom_rejected": bool(ratio_include_headroom_rejected),
             "min_samples_per_filter": int(ratio_min_samples_per_filter),
@@ -803,7 +924,6 @@ def solve_training_session(
             sky_limited_penalty_weight=float(sky_limited_penalty_weight),
         )
 
-        # If ratio dict missing (rare), fall back to scoring dict
         per_filter_E_ratio_final = per_filter_E_ratio or dict(per_filter_E_scoring)
 
         evals.append(
@@ -913,34 +1033,99 @@ def solve_training_session(
     if second is not None:
         second_tf, second_ratio = ratios_from_per_filter_E(second.per_filter_E_ratio)
 
-    # Aggregate per_filter_E (weighted) using ratio dictionaries
-    agg_num: Dict[str, float] = {f.upper(): 0.0 for f in required_filters}
-    agg_den: float = 0.0
-    agg_used_exps: List[int] = []
+    # -----------------------------
+    # EDIT: robust + transparency-aware aggregate ratios
+    # -----------------------------
+    tp_vals_all = [
+        float(e.avg_transparency_proxy)
+        for e in evals
+        if e.avg_transparency_proxy is not None
+        and math.isfinite(float(e.avg_transparency_proxy))
+    ]
+    tp_med = _quantile(tp_vals_all, 0.50) if tp_vals_all else None
 
-    for e in evals:
-        w = 1.0
+    def _tp_weight(e: ExposureEval) -> float:
+        if tp_med is None:
+            return 1.0
+        tp = e.avg_transparency_proxy
+        if tp is None:
+            return 1.0
+        try:
+            tpf = float(tp)
+        except Exception:
+            return 1.0
+        if not math.isfinite(tpf) or tpf <= 0:
+            return 1.0
+        raw = float(tp_med) / float(tpf)  # darker-than-median => >1, brighter => <1
+        clamp = float(aggregate_transparency_weight_clamp)
+        return max(1.0 / clamp, min(clamp, raw))
+
+    def _base_weight(e: ExposureEval) -> float:
+        if aggregate_ratio_weight_mode == "uniform":
+            return 1.0
         if aggregate_ratio_weight_mode == "nebula_over_sky":
-            if e.avg_nebula_over_sky is not None:
-                w = float(e.avg_nebula_over_sky)
-            if not math.isfinite(w) or w <= 0:
-                w = 1.0
-
-        for f in required_filters:
-            agg_num[f.upper()] += w * float(e.per_filter_E_ratio.get(f.upper(), 0.0))
-        agg_den += w
-        agg_used_exps.append(int(round(float(e.exptime_s))))
-
-    if agg_den <= 0:
-        agg_den = float(len(evals))
-        for f in required_filters:
-            agg_num[f.upper()] = sum(
-                float(e.per_filter_E_ratio.get(f.upper(), 0.0)) for e in evals
+            w = (
+                float(e.avg_nebula_over_sky)
+                if e.avg_nebula_over_sky is not None
+                else 1.0
             )
+            return w if (math.isfinite(w) and w > 0) else 1.0
+        if aggregate_ratio_weight_mode == "inverse_transparency":
+            return 1.0  # tp applied separately
+        if aggregate_ratio_weight_mode == "combined":
+            w = (
+                float(e.avg_nebula_over_sky)
+                if e.avg_nebula_over_sky is not None
+                else 1.0
+            )
+            w = w if (math.isfinite(w) and w > 0) else 1.0
+            return w
+        return 1.0
 
-    agg_per_filter_E = {
-        f.upper(): (agg_num[f.upper()] / agg_den) for f in required_filters
-    }
+    def _final_weight(e: ExposureEval) -> float:
+        w = _base_weight(e)
+        if aggregate_ratio_weight_mode in ("inverse_transparency", "combined"):
+            w *= _tp_weight(e)
+        if not math.isfinite(w) or w <= 0:
+            return 1.0
+        return float(w)
+
+    agg_used_exps: List[int] = [int(round(float(e.exptime_s))) for e in evals]
+    weights = [_final_weight(e) for e in evals]
+
+    agg_per_filter_E: Dict[str, float] = {}
+    for f in required_filters:
+        vals: List[float] = []
+        ws: List[float] = []
+        for e, w in zip(evals, weights):
+            v = e.per_filter_E_ratio.get(f.upper())
+            if v is None:
+                continue
+            vf = float(v)
+            if not math.isfinite(vf):
+                continue
+            vals.append(vf)
+            ws.append(float(w))
+
+        if not vals:
+            agg_per_filter_E[f.upper()] = 0.0
+            continue
+
+        if aggregate_ratio_method == "mean":
+            m = _weighted_mean(vals, ws)
+        elif aggregate_ratio_method == "median":
+            m = _weighted_quantile(vals, ws, 0.50)
+        else:
+            q = float(aggregate_ratio_winsor_q)
+            m = _weighted_winsorized_mean(vals, ws, lo_q=q, hi_q=1.0 - q)
+
+        if m is None or not math.isfinite(float(m)):
+            m = _weighted_mean(vals, ws)
+        if m is None or not math.isfinite(float(m)):
+            m = float(sum(vals) / len(vals))
+
+        agg_per_filter_E[f.upper()] = float(m)
+
     agg_tf, agg_ratio = ratios_from_per_filter_E(agg_per_filter_E)
 
     agg_Es = list(agg_per_filter_E.values()) or [0.0]
@@ -965,9 +1150,9 @@ def solve_training_session(
     transparency_stats: Dict[str, Any] = {}
 
     if len(tp_vals) >= 2:
-        p10 = _quantile(tp_vals, 0.10)
-        p50 = _quantile(tp_vals, 0.50)
-        p90 = _quantile(tp_vals, 0.90)
+        p10 = _quantile([float(x) for x in tp_vals], 0.10)
+        p50 = _quantile([float(x) for x in tp_vals], 0.50)
+        p90 = _quantile([float(x) for x in tp_vals], 0.90)
         if p10 is not None and p50 is not None and p90 is not None and p50 > 0:
             spread_frac = float(p90 - p10) / float(p50)
             transparency_stats = {
@@ -983,7 +1168,7 @@ def solve_training_session(
                 )
 
     # -----------------------------
-    # Stage 5: ratio stability + sample counts
+    # Stage 5: ratio stability + sample counts (existing)
     # -----------------------------
     ratio_samples_per_filter: Dict[str, List[float]] = {
         f.upper(): [] for f in required_filters
@@ -1032,7 +1217,6 @@ def solve_training_session(
         recommended_tf = agg_tf
         recommended_ratio = agg_ratio
 
-    # If stability warnings exist, prefer aggregate as well (it’s usually less twitchy)
     if ratio_stability_warning:
         ratio_source = "aggregate"
         recommended_tf = agg_tf
@@ -1135,6 +1319,10 @@ def solve_training_session(
                 ),
                 "exposures_used": sorted(set(agg_used_exps)),
                 "weight_mode": aggregate_ratio_weight_mode,
+                "method": aggregate_ratio_method,
+                "winsor_q": float(aggregate_ratio_winsor_q),
+                "tp_median": (float(tp_med) if tp_med is not None else None),
+                "tp_weight_clamp": float(aggregate_transparency_weight_clamp),
                 "ratio_includes_headroom_rejected": bool(
                     ratio_include_headroom_rejected
                 ),

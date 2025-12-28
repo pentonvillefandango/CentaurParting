@@ -245,6 +245,26 @@ class AppConfig:
     # (2) Aggregate ratio weighting:
     # "nebula_over_sky" stabilises ratios using a brightness proxy; "uniform" averages exposures equally.
     training_aggregate_ratio_weight_mode: str = "nebula_over_sky"
+    # ---------------------------------------------------------------------
+    # Training ratios (Stage 4-5): robust aggregate + transparency weighting
+    # ---------------------------------------------------------------------
+    # Aggregate ratio method:
+    #   - "winsor" (default): clamps extremes to [q, 1-q] then averages (robust)
+    #   - "median": weighted median
+    #   - "mean": simple weighted mean (least robust)
+    training_aggregate_ratio_method: str = "winsor"
+    training_aggregate_ratio_winsor_q: float = 0.15  # 0.15 => clamp to [15%, 85%]
+
+    # Aggregate ratio weighting mode:
+    #   - "nebula_over_sky": prefers exposures with stronger nebula/sky contrast
+    #   - "inverse_transparency": downweights exposures with brighter sky (moon/cloud)
+    #   - "combined": nebula_over_sky * inverse_transparency
+    #   - "uniform": all exposures equal
+    training_aggregate_ratio_weight_mode: str = "combined"
+
+    # How aggressively to clamp transparency weighting (prevents one exposure dominating)
+    # Higher = allows more dominance; 4.0 is a sane default.
+    training_aggregate_transparency_weight_clamp: float = 4.0
 
     def is_module_enabled(self, module_name: str) -> bool:
         return self.enabled_modules.get(module_name, False)
