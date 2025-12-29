@@ -90,7 +90,12 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             ]
         )
         corner_med = float(np.median(corners))
-        corner_vignette_frac = float(corner_med / median) if median != 0 else 0.0
+
+        # NEW: retain the raw ratio (unclamped) for diagnostics
+        corner_vignette_ratio_raw = float(corner_med / median) if median != 0 else 0.0
+
+        # Keep the bounded feature for downstream stability
+        corner_vignette_frac = max(0.0, min(1.0, corner_vignette_ratio_raw))
 
         # Gradient estimate via image gradients (simple)
         gy, gx = np.gradient(arr)
@@ -98,11 +103,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         grad_p95 = float(np.percentile(grad_mag, 95))
 
         # Basic usability heuristic (v1)
-        usable = int(
-            (median > 0) and
-            (clipped_high < 0.02) and
-            (clipped_low < 0.02)
-        )
+        usable = int((median > 0) and (clipped_high < 0.02) and (clipped_low < 0.02))
 
         with Database().transaction() as db:
             row = db.execute(
@@ -129,18 +130,27 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     mean_adu, median_adu, std_adu, madstd_adu,
                     min_adu, max_adu,
                     clipped_low_frac, clipped_high_frac,
-                    corner_vignette_frac, gradient_p95,
+                    corner_vignette_frac,
+                    corner_vignette_ratio_raw,
+                    gradient_p95,
                     usable,
                     db_written_utc
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     image_id,
-                    mean, median, std, madstd,
-                    minv, maxv,
-                    clipped_low, clipped_high,
-                    corner_vignette_frac, grad_p95,
+                    mean,
+                    median,
+                    std,
+                    madstd,
+                    minv,
+                    maxv,
+                    clipped_low,
+                    clipped_high,
+                    corner_vignette_frac,
+                    corner_vignette_ratio_raw,
+                    grad_p95,
                     usable,
                     utc_now(),
                 ),

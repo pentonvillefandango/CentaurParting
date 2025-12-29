@@ -2,9 +2,12 @@
 # centaur/model_tests/models/test_flat_metrics.py
 #
 # Model test for flat_metrics.
-# - Defines population as FITS imagetyp in ('FLAT','')?  (we use robust FLAT matching)
+# - Defines population as FITS imagetyp in ('FLAT','SKYFLAT','DOMEFLAT')
 # - Uses a LEFT JOIN base query so we can detect missing metrics rows without losing frames
-# - Performs deep per-row invariants on any columns that exist (schema-tolerant)
+# - Performs schema-tolerant invariants; checks only columns that exist
+# - Adds explicit invariants/warnings for:
+#     * corner_vignette_frac in [0,1] (FAIL if violated)
+#     * corner_vignette_ratio_raw (WARN if outside reasonable range; WARN if > 1.01)
 # - Output directory rules:
 #     * If run directly: data/model_tests/flat_metrics/test_results_<stamp>/
 #     * If run by master: <run_dir>/flat_metrics/
@@ -96,6 +99,11 @@ def _add_issue(issues: List[str], msg: str) -> None:
         issues.append(msg)
 
 
+def _add_warn(warnings: List[str], msg: str) -> None:
+    if msg and msg not in warnings:
+        warnings.append(msg)
+
+
 @dataclass
 class FailRow:
     image_id: int
@@ -131,8 +139,6 @@ def _make_out_paths(
     return base_dir, out_json, out_csv
 
 
-# Robust FLAT detection. We treat blank imagetyp as NOT-FLAT for this test.
-# If you want blanks included, we can add a flag later.
 BASE_JOIN_SQL = """
 SELECT
   i.image_id,
@@ -200,7 +206,12 @@ def _required_schema_checks(
     return (len(issues) == 0), issues, warnings
 
 
-def _check_one_row(r: Dict[str, Any], fm_cols: List[str]) -> List[str]:
+def _check_one_row(
+    r: Dict[str, Any],
+    fm_cols: List[str],
+    row_warnings: List[str],
+    cfg: Dict[str, Any],
+) -> List[str]:
     issues: List[str] = []
 
     # missing metrics row
@@ -234,6 +245,35 @@ def _check_one_row(r: Dict[str, Any], fm_cols: List[str]) -> List[str]:
         dbw = r.get("db_written_utc")
         if dbw is None or (isinstance(dbw, str) and not dbw.strip()):
             _add_issue(issues, "db_written_utc_missing")
+
+    # === Flat-specific vignette checks ===
+    # Bounded metric must be in [0,1]
+    if _has_col(fm_cols, "corner_vignette_frac"):
+        cvf = _safe_float(r.get("corner_vignette_frac"))
+        if cvf is None:
+            _add_issue(issues, "corner_vignette_frac_missing")
+        elif not (0.0 <= cvf <= 1.0):
+            _add_issue(issues, "corner_vignette_frac_out_of_range")
+
+    # Raw ratio: not required for legacy DBs, but if column exists we expect it to be set.
+    if _has_col(fm_cols, "corner_vignette_ratio_raw"):
+        raw = _safe_float(r.get("corner_vignette_ratio_raw"))
+        if raw is None:
+            _add_issue(issues, "corner_vignette_ratio_raw_missing")
+        else:
+            lo = float(cfg["corner_vignette_ratio_raw_warn_lo"])
+            hi = float(cfg["corner_vignette_ratio_raw_warn_hi"])
+            gt1 = float(cfg["corner_vignette_ratio_raw_warn_gt"])
+            if raw < lo or raw > hi:
+                _add_warn(
+                    row_warnings,
+                    f"corner_vignette_ratio_raw_outside_warn_band({lo},{hi}):{raw:.6f}",
+                )
+            if raw > gt1:
+                _add_warn(
+                    row_warnings,
+                    f"corner_vignette_ratio_raw_gt_{gt1:.3f}:{raw:.6f}",
+                )
 
     # Common fraction-like fields: if present, must be in [0,1]
     for col in (
@@ -274,12 +314,10 @@ def _check_one_row(r: Dict[str, Any], fm_cols: List[str]) -> List[str]:
             if abs(exptime_hdr - exptime_s) > 0.01:
                 _add_issue(issues, "exptime_s_mismatch_header")
 
-    # Numeric sanity: any *_adu or *_adu_s fields present should not be NaN/inf (safe_float already filters)
-    # But we can flag if they exist and are NULL, which is usually suspicious for a metrics table.
+    # Numeric sanity: any *_adu or *_adu_s fields present should not be NULL (usually suspicious)
     for c in fm_cols:
         if c.endswith("_adu") or c.endswith("_adu_s"):
-            if c == "roi_madstd_adu_s" or c == "ff_madstd_adu_s":
-                # these might legitimately be NULL sometimes; keep as soft.
+            if c in ("roi_madstd_adu_s", "ff_madstd_adu_s"):
                 continue
             if r.get(c) is None:
                 _add_issue(issues, f"{c}_missing")
@@ -319,6 +357,8 @@ def _rollup(rows: List[Dict[str, Any]], fm_cols: List[str]) -> List[Dict[str, An
                 "_roi_med": [],
                 "_nan": [],
                 "_inf": [],
+                "_cvf": [],
+                "_raw": [],
             },
         )
         g["n_frames"] += 1
@@ -334,6 +374,11 @@ def _rollup(rows: List[Dict[str, Any]], fm_cols: List[str]) -> List[Dict[str, An
             g["_nan"].append(_safe_float(r.get("nan_fraction")))
         if _has_col(fm_cols, "inf_fraction"):
             g["_inf"].append(_safe_float(r.get("inf_fraction")))
+
+        if _has_col(fm_cols, "corner_vignette_frac"):
+            g["_cvf"].append(_safe_float(r.get("corner_vignette_frac")))
+        if _has_col(fm_cols, "corner_vignette_ratio_raw"):
+            g["_raw"].append(_safe_float(r.get("corner_vignette_ratio_raw")))
 
     out: List[Dict[str, Any]] = []
     for k, g in sorted(
@@ -370,6 +415,16 @@ def _rollup(rows: List[Dict[str, Any]], fm_cols: List[str]) -> List[Dict[str, An
                     None
                     if not g["_inf"]
                     else (None if avg(g["_inf"]) is None else round(avg(g["_inf"]), 6))
+                ),
+                "avg_corner_vignette_frac": (
+                    None
+                    if not g["_cvf"]
+                    else (None if avg(g["_cvf"]) is None else round(avg(g["_cvf"]), 6))
+                ),
+                "avg_corner_vignette_ratio_raw": (
+                    None
+                    if not g["_raw"]
+                    else (None if avg(g["_raw"]) is None else round(avg(g["_raw"]), 6))
                 ),
             }
         )
@@ -415,7 +470,18 @@ def main() -> int:
         help="If 1, FAIL when no FLAT frames are found. Default 1.",
     )
 
+    # New warning thresholds for raw vignette ratio
+    ap.add_argument("--corner-vignette-raw-warn-lo", type=float, default=0.5)
+    ap.add_argument("--corner-vignette-raw-warn-hi", type=float, default=1.5)
+    ap.add_argument("--corner-vignette-raw-warn-gt", type=float, default=1.01)
+
     args = ap.parse_args()
+
+    cfg = {
+        "corner_vignette_ratio_raw_warn_lo": float(args.corner_vignette_raw_warn_lo),
+        "corner_vignette_ratio_raw_warn_hi": float(args.corner_vignette_raw_warn_hi),
+        "corner_vignette_ratio_raw_warn_gt": float(args.corner_vignette_raw_warn_gt),
+    }
 
     stamp = _utc_stamp()
     db_path = Path(args.db)
@@ -470,6 +536,11 @@ def main() -> int:
             "notes": {
                 "base_query": BASE_JOIN_SQL.strip(),
                 "max_fail_rows_captured": int(args.max_fail_rows),
+                "vignette_raw_warn_band": [
+                    cfg["corner_vignette_ratio_raw_warn_lo"],
+                    cfg["corner_vignette_ratio_raw_warn_hi"],
+                ],
+                "vignette_raw_warn_gt": cfg["corner_vignette_ratio_raw_warn_gt"],
             },
         }
         out_json.write_text(json.dumps(result, indent=2))
@@ -485,13 +556,25 @@ def main() -> int:
 
     n_missing = 0
     issue_counts: Dict[str, int] = {}
+    row_warn_counts: Dict[str, int] = {}
     failing: List[FailRow] = []
+    row_warnings_seen: List[str] = []
 
     for r in rows:
-        issues = _check_one_row(r, fm_cols)
+        row_warnings: List[str] = []
+        issues = _check_one_row(r, fm_cols, row_warnings, cfg)
 
         if r.get("m_image_id") is None:
             n_missing += 1
+
+        if row_warnings:
+            for w in row_warnings:
+                row_warn_counts[w] = row_warn_counts.get(w, 0) + 1
+            # store some examples
+            if len(row_warnings_seen) < 40:
+                row_warnings_seen.extend(
+                    row_warnings[: max(0, 40 - len(row_warnings_seen))]
+                )
 
         if issues:
             for it in issues:
@@ -542,11 +625,20 @@ def main() -> int:
         "issue_counts": dict(
             sorted(issue_counts.items(), key=lambda kv: kv[1], reverse=True)
         ),
+        "row_warning_counts": dict(
+            sorted(row_warn_counts.items(), key=lambda kv: kv[1], reverse=True)
+        ),
+        "row_warning_examples": row_warnings_seen,
         "rollup_by_camera_object_filter_exptime": _rollup(rows, fm_cols),
         "failing_examples": [fr.__dict__ for fr in failing],
         "notes": {
             "base_query": BASE_JOIN_SQL.strip(),
             "max_fail_rows_captured": int(args.max_fail_rows),
+            "vignette_raw_warn_band": [
+                cfg["corner_vignette_ratio_raw_warn_lo"],
+                cfg["corner_vignette_ratio_raw_warn_hi"],
+            ],
+            "vignette_raw_warn_gt": cfg["corner_vignette_ratio_raw_warn_gt"],
         },
     }
 
@@ -591,6 +683,10 @@ def main() -> int:
         top = sorted(issue_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
         for k, v in top:
             print(f"  issue::{k}={v}")
+    if row_warn_counts:
+        topw = sorted(row_warn_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        for k, v in topw:
+            print(f"  row_warn::{k}={v}")
 
     print(f"[test_{MODEL_NAME}] wrote_json={out_json}")
     if write_csv:

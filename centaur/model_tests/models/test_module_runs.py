@@ -50,6 +50,7 @@ EXPECTED_WORKERS: List[str] = [
     "psf_model_worker",
     "masked_signal_worker",
     "exposure_advice_worker",
+    "frame_quality_worker",
 ]
 
 # Worker -> metrics table that should have image_id if worker ran OK
@@ -68,6 +69,7 @@ WORKER_TO_METRICS_TABLE: Dict[str, str] = {
     "psf_model_worker": "psf_model_metrics",
     "masked_signal_worker": "masked_signal_metrics",
     "exposure_advice_worker": "exposure_advice",
+    "frame_quality_worker": "frame_quality_metrics",
 }
 
 

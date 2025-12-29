@@ -269,6 +269,16 @@ def main() -> int:
             "centaur/model_tests/models/test_frame_quality_metrics.py",
             True,
         ),
+        (
+            "training_derived_metrics",
+            "centaur/model_tests/models/test_training_derived_metrics.py",
+            True,
+        ),
+        (
+            "training_session_results",
+            "centaur/model_tests/models/test_training_session_results.py",
+            True,
+        ),
     ]
 
     if args.dep:
