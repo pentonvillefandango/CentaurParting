@@ -7,13 +7,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from astropy.io import fits  # type: ignore
 
 from centaur.config import AppConfig
 from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
 from centaur.pipeline import ModuleRunRecord, PipelineContext
+
+# V1b: shared pixels loader (FITS + XISF)
+from centaur.io.frame_loader import load_pixels
 
 MODULE_NAME = "star_headroom_worker"
 
@@ -112,16 +114,13 @@ def _derive_saturation_adu(
       4) bitpix-derived vmax fallback
       5) raw max_pixel_adu fallback
     """
-    # 1) Prefer header datamax if present
     datamax = _safe_float(core.get("datamax"))
     if datamax is not None and datamax > 0:
         return datamax, "header_datamax"
 
-    # 2) Prefer explicit saturation_adu if present
     if sat_adu is not None and sat_adu > 0:
         return sat_adu, "saturation_metrics"
 
-    # 3) If measured max pixel is "near full scale", treat it as effective ceiling
     vmax = _bitpix_vmax(core)
     if (
         vmax is not None
@@ -129,15 +128,12 @@ def _derive_saturation_adu(
         and max_pixel_adu is not None
         and max_pixel_adu > 0
     ):
-        # near-top threshold (tunable): 98% of vmax
         if max_pixel_adu >= 0.98 * vmax:
             return max_pixel_adu, "max_pixel_near_fullscale"
 
-    # 4) bitpix-derived ceiling
     if vmax is not None and vmax > 0:
         return vmax, "bitpix_vmax"
 
-    # 5) last resort
     if max_pixel_adu is not None and max_pixel_adu > 0:
         return max_pixel_adu, "fallback_max_pixel"
 
@@ -165,7 +161,6 @@ def _extract_star_peaks(
         if cut.size < 4:
             continue
 
-        # Robust “peak”: high percentile, not max
         p = _safe_float(np.percentile(cut, q))
         if p is not None:
             peaks.append(float(p))
@@ -188,16 +183,13 @@ def process_file_event(
     sample_r = int(getattr(cfg, "star_headroom_sample_radius_px", 2))
     peak_q = float(getattr(cfg, "star_headroom_peak_percentile", 99.5))
 
-    # Tiny epsilon so "equals ceiling" counts as saturated
     sat_eps_adu = float(getattr(cfg, "star_headroom_sat_eps_adu", 0.5))
 
     try:
-        with fits.open(event.file_path, memmap=False) as hdul:
-            data = hdul[0].data
-
-        arr2d = _flatten_image_data(data)
+        # V1b: load pixels via shared loader (FITS + XISF)
+        arr2d = _flatten_image_data(load_pixels(event.file_path))
         if arr2d.size == 0:
-            raise ValueError("unsupported_fits_data_shape")
+            raise ValueError("unsupported_image_data_shape")
 
         with Database().transaction() as db:
             image_id = _get_image_id(db, event.file_path)
@@ -219,7 +211,7 @@ def process_file_event(
                     stars_xy = [
                         (int(p["x"]), int(p["y"]))
                         for p in ctx.psf1["star_xy"]
-                        if "x" in p and "y" in p
+                        if isinstance(p, dict) and "x" in p and "y" in p
                     ]
                 except Exception:
                     stars_xy = []

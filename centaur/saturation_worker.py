@@ -6,13 +6,15 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-from astropy.io import fits  # type: ignore
 
 from centaur.config import AppConfig
 from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
 from centaur.pipeline import ModuleRunRecord
+
+# Shared pixel loader (FITS + XISF)
+from centaur.io.frame_loader import load_pixels
 
 MODULE_NAME = "saturation_worker"
 
@@ -38,19 +40,6 @@ def _nan_inf_fractions(arr: np.ndarray) -> Tuple[float, float]:
     nan_count = int(np.isnan(arr).sum())
     inf_count = int(np.isinf(arr).sum())
     return nan_count / total, inf_count / total
-
-
-def _flatten_image_data(data: np.ndarray) -> np.ndarray:
-    if data is None:
-        return np.array([], dtype=np.float64)
-
-    arr = np.asarray(data)
-    if arr.ndim == 3 and arr.shape[0] == 1:
-        arr = arr[0]
-    if arr.ndim != 2:
-        return np.array([], dtype=np.float64)
-
-    return arr.astype(np.float64, copy=False)
 
 
 def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
@@ -142,12 +131,16 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
     fields: Dict[str, Any] = {}
 
     try:
-        with fits.open(event.file_path, memmap=False) as hdul:
-            data = hdul[0].data
+        # Load pixels (FITS + XISF) as float32 (or best-effort luminance proxy for multi-channel)
+        px = load_pixels(event.file_path)  # expected 2D float32
+        arr2d = np.asarray(px, dtype=np.float64)
 
-        arr2d = _flatten_image_data(data)
-        if arr2d.size == 0:
-            raise ValueError("unsupported_fits_data_shape")
+        if arr2d.ndim == 3 and arr2d.shape[0] == 1:
+            arr2d = arr2d[0]
+        if arr2d.ndim != 2 or arr2d.size == 0:
+            raise ValueError(
+                f"unsupported_image_data_shape:{getattr(arr2d, 'shape', None)}"
+            )
 
         nan_fraction, inf_fraction = _nan_inf_fractions(arr2d)
 

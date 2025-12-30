@@ -9,15 +9,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from astropy.io import fits  # type: ignore
 
 from centaur.config import AppConfig
 from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
-
-# NEW: return record so pipeline writes module_runs centrally (with duration_us)
 from centaur.pipeline import ModuleRunRecord
+
+# Shared pixel loader (FITS + XISF)
+from centaur.io.frame_loader import load_pixels
 
 MODULE_NAME = "psf_basic_worker"
 
@@ -36,20 +36,9 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
-def _flatten_image_data(data: np.ndarray) -> np.ndarray:
-    if data is None:
-        return np.array([], dtype=np.float64)
-
-    arr = np.asarray(data)
-    if arr.ndim == 3 and arr.shape[0] == 1:
-        arr = arr[0]
-    if arr.ndim != 2:
-        return np.array([], dtype=np.float64)
-
-    return arr.astype(np.float64, copy=False)
-
-
-def _central_roi(arr2d: np.ndarray, roi_fraction: float) -> Tuple[np.ndarray, Tuple[int, int]]:
+def _central_roi(
+    arr2d: np.ndarray, roi_fraction: float
+) -> Tuple[np.ndarray, Tuple[int, int]]:
     roi_fraction = float(roi_fraction)
     roi_fraction = max(0.1, min(1.0, roi_fraction))
 
@@ -61,7 +50,9 @@ def _central_roi(arr2d: np.ndarray, roi_fraction: float) -> Tuple[np.ndarray, Tu
     return arr2d[y0 : y0 + rh, x0 : x0 + rw], (x0, y0)
 
 
-def _robust_bg_median_madstd(values_1d: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
+def _robust_bg_median_madstd(
+    values_1d: np.ndarray,
+) -> Tuple[Optional[float], Optional[float]]:
     finite = values_1d[np.isfinite(values_1d)]
     if finite.size == 0:
         return None, None
@@ -78,7 +69,9 @@ class Peak:
     value: float
 
 
-def _local_maxima_3x3(img2d: np.ndarray, threshold_adu: float) -> Tuple[np.ndarray, np.ndarray]:
+def _local_maxima_3x3(
+    img2d: np.ndarray, threshold_adu: float
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Fast 3x3 local maxima finder above threshold. Returns (xs, ys).
     """
@@ -103,14 +96,14 @@ def _local_maxima_3x3(img2d: np.ndarray, threshold_adu: float) -> Tuple[np.ndarr
     n7 = pad[2:, 2:]
 
     is_peak = m
-    is_peak &= (center >= n0)
-    is_peak &= (center >= n1)
-    is_peak &= (center >= n2)
-    is_peak &= (center >= n3)
-    is_peak &= (center >= n4)
-    is_peak &= (center >= n5)
-    is_peak &= (center >= n6)
-    is_peak &= (center >= n7)
+    is_peak &= center >= n0
+    is_peak &= center >= n1
+    is_peak &= center >= n2
+    is_peak &= center >= n3
+    is_peak &= center >= n4
+    is_peak &= center >= n5
+    is_peak &= center >= n6
+    is_peak &= center >= n7
 
     ys, xs = np.nonzero(is_peak)
     return xs.astype(np.int32, copy=False), ys.astype(np.int32, copy=False)
@@ -138,7 +131,14 @@ def _grid_key(x: int, y: int, cell: int) -> Tuple[int, int]:
     return (x // cell, y // cell)
 
 
-def _grid_accept(accepted: Dict[Tuple[int, int], Tuple[int, int]], x: int, y: int, cell: int, min_sep2: float) -> bool:
+def _grid_accept(
+    accepted: Dict[Tuple[int, int], Tuple[int, int]],
+    x: int,
+    y: int,
+    *,
+    cell: int,
+    min_sep2: float,
+) -> bool:
     gx, gy = _grid_key(x, y, cell)
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
@@ -220,7 +220,6 @@ def _measure_star(cut: np.ndarray) -> Optional[Tuple[float, float, float, float]
     dx = xx - cx
     dy = yy - cy
 
-    # Second central moments
     mxx = float((dx * dx * data).sum() / total)
     myy = float((dy * dy * data).sum() / total)
     mxy = float((dx * dy * data).sum() / total)
@@ -228,7 +227,6 @@ def _measure_star(cut: np.ndarray) -> Optional[Tuple[float, float, float, float]
     if not np.isfinite(mxx) or not np.isfinite(myy) or mxx <= 0 or myy <= 0:
         return None
 
-    # Eigenvalues of covariance-like matrix give axis sigmas
     tr = mxx + myy
     det = mxx * myy - mxy * mxy
     if det <= 0:
@@ -249,7 +247,9 @@ def _measure_star(cut: np.ndarray) -> Optional[Tuple[float, float, float, float]
     ecc = 1.0 - (sigma_minor / sigma_major)
     theta = 0.5 * float(np.arctan2(2.0 * mxy, (mxx - myy)))
 
-    sigma_eff = float(np.sqrt(0.5 * (sigma_major * sigma_major + sigma_minor * sigma_minor)))
+    sigma_eff = float(
+        np.sqrt(0.5 * (sigma_major * sigma_major + sigma_minor * sigma_minor))
+    )
     fwhm = 2.355 * sigma_eff
 
     r = np.sqrt(dx * dx + dy * dy)
@@ -260,7 +260,12 @@ def _measure_star(cut: np.ndarray) -> Optional[Tuple[float, float, float, float]
         return None
     hfr = float(r.flat[order][idx])
 
-    if not (np.isfinite(hfr) and np.isfinite(fwhm) and np.isfinite(ecc) and np.isfinite(theta)):
+    if not (
+        np.isfinite(hfr)
+        and np.isfinite(fwhm)
+        and np.isfinite(ecc)
+        and np.isfinite(theta)
+    ):
         return None
 
     return hfr, fwhm, ecc, theta
@@ -272,7 +277,9 @@ def _pct(vals: List[float], p: float) -> Optional[float]:
     return _safe_float(np.percentile(np.asarray(vals, dtype=np.float64), p))
 
 
-def _maybe_dump_psf1_csv(cfg: AppConfig, image_id: int, file_path: Path, rows: List[Dict[str, Any]]) -> None:
+def _maybe_dump_psf1_csv(
+    cfg: AppConfig, image_id: int, file_path: Path, rows: List[Dict[str, Any]]
+) -> None:
     if not getattr(cfg, "psf1_debug_dump_measurements_csv", False):
         return
 
@@ -284,7 +291,16 @@ def _maybe_dump_psf1_csv(cfg: AppConfig, image_id: int, file_path: Path, rows: L
         w = csv.writer(f)
         w.writerow(["x", "y", "hfr_px", "fwhm_px", "ecc", "theta_rad"])
         for r in rows:
-            w.writerow([r["x"], r["y"], f"{r['hfr_px']:.6f}", f"{r['fwhm_px']:.6f}", f"{r['ecc']:.6f}", f"{r['theta_rad']:.6f}"])
+            w.writerow(
+                [
+                    r["x"],
+                    r["y"],
+                    f"{r['hfr_px']:.6f}",
+                    f"{r['fwhm_px']:.6f}",
+                    f"{r['ecc']:.6f}",
+                    f"{r['theta_rad']:.6f}",
+                ]
+            )
 
 
 def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
@@ -295,7 +311,9 @@ def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
     return int(row["image_id"]) if row else None
 
 
-def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ctx: Optional[Any] = None) -> Any:
+def process_file_event(
+    cfg: AppConfig, logger: Logger, event: FileReadyEvent, ctx: Optional[Any] = None
+) -> Any:
     t0 = time.monotonic()
 
     use_roi = getattr(cfg, "psf_use_roi", True)
@@ -306,19 +324,27 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
     edge_margin_px = int(getattr(cfg, "psf_edge_margin_px", 16))
 
     cutout_radius_px = int(getattr(cfg, "psf_cutout_radius_px", 8))
-    max_stars_measured = int(getattr(cfg, "psf1_max_stars_measured", 5000))  # 0 = unlimited
-    max_peaks_considered = int(getattr(cfg, "psf_max_stars", 0))  # reuse PSF-0 cap if set (0=unlimited)
+    max_stars_measured = int(
+        getattr(cfg, "psf1_max_stars_measured", 5000)
+    )  # 0 = unlimited
+    max_peaks_considered = int(
+        getattr(cfg, "psf_max_stars", 0)
+    )  # reuse PSF-0 cap if set (0=unlimited)
 
     expected_fields = 0
     image_id: Optional[int] = None
 
     try:
-        with fits.open(str(event.file_path), memmap=False) as hdul:
-            data = hdul[0].data
+        px = load_pixels(event.file_path)  # 2D float32 (or luminance proxy)
+        img2d = np.asarray(px, dtype=np.float64)
 
-        img2d = _flatten_image_data(data)
-        if img2d.size == 0:
-            raise ValueError("unsupported_fits_data_shape")
+        # Defensive normalization
+        if img2d.ndim == 3 and img2d.shape[0] == 1:
+            img2d = img2d[0]
+        if img2d.ndim != 2 or img2d.size == 0:
+            raise ValueError(
+                f"unsupported_image_data_shape:{getattr(img2d, 'shape', None)}"
+            )
 
         if use_roi and roi_fraction < 1.0:
             roi2d, (x0, y0) = _central_roi(img2d, roi_fraction=roi_fraction)
@@ -337,9 +363,13 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             good_threshold_adu = float(bg_median + 100.0)
         else:
             threshold_adu = float(bg_median + threshold_sigma * bg_madstd)
-            good_threshold_adu = float(bg_median + (threshold_sigma + good_extra_sigma) * bg_madstd)
+            good_threshold_adu = float(
+                bg_median + (threshold_sigma + good_extra_sigma) * bg_madstd
+            )
 
-        peaks = _build_peaks(roi2d, threshold_adu=threshold_adu, max_peaks=max_peaks_considered)
+        peaks = _build_peaks(
+            roi2d, threshold_adu=threshold_adu, max_peaks=max_peaks_considered
+        )
         n_peaks_total = int(len(peaks))
 
         h, w = roi2d.shape[:2]
@@ -415,7 +445,11 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
             except Exception:
                 pass
 
-        star_xy_json = json.dumps([{"x": x, "y": y} for (x, y) in measured_xy]) if measured_xy else "[]"
+        star_xy_json = (
+            json.dumps([{"x": x, "y": y} for (x, y) in measured_xy])
+            if measured_xy
+            else "[]"
+        )
 
         theta_med = _pct(theta_vals, 50)
         theta_p90abs = None
@@ -508,23 +542,37 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent, ct
                 )
                 """,
                 (
-                    image_id,
-                    expected_fields, read_fields, written_fields,
-                    None, utc_now(),
-
-                    fields["roi_fraction"], fields["threshold_sigma"], fields["good_extra_sigma"],
-                    fields["min_separation_px"], fields["edge_margin_px"], fields["cutout_radius_px"], fields["max_stars_measured"],
-
-                    fields["n_peaks_total"], fields["n_peaks_good"], fields["n_measured"], fields["n_rejected_cutout"], fields["n_rejected_measure"],
-
-                    fields["hfr_px_median"], fields["hfr_px_p10"], fields["hfr_px_p90"],
-                    fields["fwhm_px_median"], fields["fwhm_px_p10"], fields["fwhm_px_p90"],
-                    fields["ecc_median"], fields["ecc_p90"],
-                    fields["theta_rad_median"], fields["theta_rad_p90abs"],
-
+                    int(image_id),
+                    expected_fields,
+                    read_fields,
+                    written_fields,
+                    None,
+                    utc_now(),
+                    fields["roi_fraction"],
+                    fields["threshold_sigma"],
+                    fields["good_extra_sigma"],
+                    fields["min_separation_px"],
+                    fields["edge_margin_px"],
+                    fields["cutout_radius_px"],
+                    fields["max_stars_measured"],
+                    fields["n_peaks_total"],
+                    fields["n_peaks_good"],
+                    fields["n_measured"],
+                    fields["n_rejected_cutout"],
+                    fields["n_rejected_measure"],
+                    fields["hfr_px_median"],
+                    fields["hfr_px_p10"],
+                    fields["hfr_px_p90"],
+                    fields["fwhm_px_median"],
+                    fields["fwhm_px_p10"],
+                    fields["fwhm_px_p90"],
+                    fields["ecc_median"],
+                    fields["ecc_p90"],
+                    fields["theta_rad_median"],
+                    fields["theta_rad_p90abs"],
                     fields["star_xy_json"],
-
-                    fields["usable"], fields["reason"],
+                    fields["usable"],
+                    fields["reason"],
                 ),
             )
 

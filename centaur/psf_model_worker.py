@@ -8,15 +8,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from astropy.io import fits  # type: ignore
 
 from centaur.config import AppConfig
 from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
-
-# NEW: pipeline writes module_runs centrally (with duration_us)
 from centaur.pipeline import ModuleRunRecord
+
+# Shared pixel loader (FITS + XISF)
+from centaur.io.frame_loader import load_pixels
 
 MODULE_NAME = "psf_model_worker"
 
@@ -101,7 +101,7 @@ def _moment_gaussian_equiv(data: np.ndarray) -> Optional[Tuple[float, float]]:
     if not np.isfinite(flux) or flux <= 0:
         return None
 
-    yy, xx = np.mgrid[:data_pos.shape[0], :data_pos.shape[1]]
+    yy, xx = np.mgrid[: data_pos.shape[0], : data_pos.shape[1]]
     x_c = float(np.sum(xx * data_pos) / flux)
     y_c = float(np.sum(yy * data_pos) / flux)
 
@@ -181,14 +181,22 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                     """,
                     (
                         image_id,
-                        expected_fields, expected_fields, 2,
+                        expected_fields,
+                        expected_fields,
+                        2,
                         utc_now(),
-                        n_input, 0,
-                        None, None, None,
-                        None, None,
-                        None, None,
+                        n_input,
+                        0,
                         None,
-                        0, "psf1_not_usable_or_no_star_list",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        0,
+                        "psf1_not_usable_or_no_star_list",
                     ),
                 )
 
@@ -201,7 +209,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 written=2,
                 status="OK",
                 duration_s=time.monotonic() - t0,
-                verbose_fields=fields_for_logging if cfg.logging.is_verbose(MODULE_NAME) else None,
+                verbose_fields=(
+                    fields_for_logging if cfg.logging.is_verbose(MODULE_NAME) else None
+                ),
             )
 
             return ModuleRunRecord(
@@ -218,14 +228,15 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         if max_stars > 0 and len(star_xy) > max_stars:
             star_xy = star_xy[:max_stars]
 
-        # Load image
-        with fits.open(str(event.file_path), memmap=False) as hdul:
-            img = np.asarray(hdul[0].data, dtype=np.float64)
+        # Load image pixels (FITS or XISF)
+        img = np.asarray(load_pixels(event.file_path), dtype=np.float64)
 
         if img.ndim == 3 and img.shape[0] == 1:
             img = img[0]
         if img.ndim != 2:
-            raise ValueError("unsupported_fits_data_shape")
+            raise ValueError(
+                f"unsupported_image_data_shape:{getattr(img, 'shape', None)}"
+            )
 
         h, w = img.shape
 
@@ -235,8 +246,13 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         n_fit_attempted = 0
         n_gauss_ok = 0
 
-        for (x, y) in star_xy:
-            if x < edge_margin or y < edge_margin or x >= (w - edge_margin) or y >= (h - edge_margin):
+        for x, y in star_xy:
+            if (
+                x < edge_margin
+                or y < edge_margin
+                or x >= (w - edge_margin)
+                or y >= (h - edge_margin)
+            ):
                 continue
 
             y0, y1 = y - fit_radius, y + fit_radius + 1
@@ -309,7 +325,12 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
 
         # written_fields for the psf_model_metrics row (simple audit count)
         written_fields = 2  # n_input_stars + n_modeled
-        for k in ("gauss_fwhm_px_median", "gauss_fwhm_px_iqr", "gauss_fwhm_px_p90", "gauss_ecc_median"):
+        for k in (
+            "gauss_fwhm_px_median",
+            "gauss_fwhm_px_iqr",
+            "gauss_fwhm_px_p90",
+            "gauss_ecc_median",
+        ):
             if fields_for_logging.get(k) is not None:
                 written_fields += 1
         written_fields += 2  # usable + reason always written
@@ -340,14 +361,22 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 """,
                 (
                     image_id,
-                    expected_fields, expected_fields, written_fields,
+                    expected_fields,
+                    expected_fields,
+                    written_fields,
                     utc_now(),
-                    n_input, n_modeled,
-                    gauss_fwhm_med, gauss_fwhm_iqr, gauss_fwhm_p90,
-                    gauss_ecc_med, None,
-                    None, None,
+                    n_input,
+                    n_modeled,
+                    gauss_fwhm_med,
+                    gauss_fwhm_iqr,
+                    gauss_fwhm_p90,
+                    gauss_ecc_med,
                     None,
-                    usable, reason,
+                    None,
+                    None,
+                    None,
+                    usable,
+                    reason,
                 ),
             )
 
@@ -360,7 +389,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             written=written_fields,
             status="OK",
             duration_s=time.monotonic() - t0,
-            verbose_fields=fields_for_logging if cfg.logging.is_verbose(MODULE_NAME) else None,
+            verbose_fields=(
+                fields_for_logging if cfg.logging.is_verbose(MODULE_NAME) else None
+            ),
         )
 
         return ModuleRunRecord(

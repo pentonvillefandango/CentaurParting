@@ -7,16 +7,16 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-from astropy.io import fits  # type: ignore
 from astropy.stats import sigma_clip  # type: ignore
 
 from centaur.config import AppConfig
 from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
-
-# NEW: structured return so pipeline writes module_runs centrally (with duration_us)
 from centaur.pipeline import ModuleRunRecord
+
+# Shared pixel loader (FITS + XISF)
+from centaur.io.frame_loader import load_pixels
 
 MODULE_NAME = "sky_background2d_worker"
 
@@ -37,7 +37,7 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
-def _flatten_image_data(data: Any) -> np.ndarray:
+def _flatten_image_data(data: Optional[np.ndarray]) -> np.ndarray:
     if data is None:
         return np.array([], dtype=np.float64)
     arr = np.asarray(data)
@@ -87,7 +87,9 @@ def _tile_sigma_clipped_median(tile: np.ndarray) -> TileResult:
     return TileResult(med, frac)
 
 
-def _build_background_map(arr2d: np.ndarray, tile_size: int) -> Tuple[np.ndarray, float]:
+def _build_background_map(
+    arr2d: np.ndarray, tile_size: int
+) -> Tuple[np.ndarray, float]:
     h, w = arr2d.shape
     tile_size = int(max(16, tile_size))
 
@@ -120,7 +122,9 @@ def _nanpercentile(x: np.ndarray, q: float) -> Optional[float]:
     return _safe_float(np.percentile(finite, q))
 
 
-def _plane_fit_slopes(bkg: np.ndarray) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+def _plane_fit_slopes(
+    bkg: np.ndarray,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     ny, nx = bkg.shape
     ys, xs = np.mgrid[0:ny, 0:nx]
     m = np.isfinite(bkg)
@@ -134,7 +138,9 @@ def _plane_fit_slopes(bkg: np.ndarray) -> Tuple[Optional[float], Optional[float]
     coef, *_ = np.linalg.lstsq(X, z, rcond=None)
     a = _safe_float(coef[0])
     b = _safe_float(coef[1])
-    mag = _safe_float(np.sqrt(a * a + b * b)) if a is not None and b is not None else None
+    mag = (
+        _safe_float(np.sqrt(a * a + b * b)) if a is not None and b is not None else None
+    )
     return a, b, mag
 
 
@@ -160,7 +166,9 @@ def _corner_delta(bkg: np.ndarray) -> Optional[float]:
         dtype=np.float64,
     )
     corners = corners[np.isfinite(corners)]
-    return _safe_float(float(np.max(corners) - np.min(corners))) if corners.size else None
+    return (
+        _safe_float(float(np.max(corners) - np.min(corners))) if corners.size else None
+    )
 
 
 def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Any:
@@ -172,12 +180,9 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
     image_id: Optional[int] = None
 
     try:
-        with fits.open(event.file_path, memmap=False) as hdul:
-            data = hdul[0].data
-
-        arr2d = _flatten_image_data(data)
+        arr2d = _flatten_image_data(load_pixels(event.file_path))
         if arr2d.size == 0:
-            raise ValueError("unsupported_fits_data_shape")
+            raise ValueError("unsupported_image_data_shape")
 
         bkg, clipped_fraction_mean = _build_background_map(arr2d, tile_size_px)
         ny, nx = bkg.shape
@@ -185,11 +190,17 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         bkg2d_median = _safe_float(np.nanmedian(bkg))
         bkg2d_min = _safe_float(np.nanmin(bkg)) if np.isfinite(bkg).any() else None
         bkg2d_max = _safe_float(np.nanmax(bkg)) if np.isfinite(bkg).any() else None
-        bkg2d_range = _safe_float(bkg2d_max - bkg2d_min) if bkg2d_min is not None and bkg2d_max is not None else None
+        bkg2d_range = (
+            _safe_float(bkg2d_max - bkg2d_min)
+            if (bkg2d_min is not None and bkg2d_max is not None)
+            else None
+        )
 
         p5 = _nanpercentile(bkg, 5)
         p95 = _nanpercentile(bkg, 95)
-        p95_minus_p5 = _safe_float(p95 - p5) if p5 is not None and p95 is not None else None
+        p95_minus_p5 = (
+            _safe_float(p95 - p5) if (p5 is not None and p95 is not None) else None
+        )
 
         finite_vals = bkg[np.isfinite(bkg)]
         bkg2d_rms = _safe_float(np.std(finite_vals)) if finite_vals.size else None
@@ -198,7 +209,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         grad_mean, grad_p95 = _gradient_stats(bkg)
         corner_delta = _corner_delta(bkg)
 
-        # DB write (metrics only; pipeline owns module_runs)
         with Database().transaction() as db:
             image_id = _get_image_id(db, event.file_path)
             if image_id is None:
@@ -206,9 +216,17 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
 
             exptime_s = _get_exptime_s(db, image_id)
 
-            if exptime_s is not None and exptime_s > 0:
-                bkg2d_median_s = _safe_float(bkg2d_median / exptime_s) if bkg2d_median is not None else None
-                slope_mag_s = _safe_float(slope_mag / exptime_s) if slope_mag is not None else None
+            if exptime_s and exptime_s > 0:
+                bkg2d_median_s = (
+                    _safe_float(bkg2d_median / exptime_s)
+                    if bkg2d_median is not None
+                    else None
+                )
+                slope_mag_s = (
+                    _safe_float(slope_mag / exptime_s)
+                    if slope_mag is not None
+                    else None
+                )
             else:
                 bkg2d_median_s = None
                 slope_mag_s = None
@@ -266,15 +284,30 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 """,
                 (
                     image_id,
-                    expected_fields, expected_fields, written_fields,
-                    exptime_s, tile_size_px, nx, ny,
-                    clipped_fraction_mean, None, utc_now(),
-                    bkg2d_median, bkg2d_min, bkg2d_max, bkg2d_range,
-                    p95_minus_p5, bkg2d_rms,
-                    slope_x, slope_y, slope_mag,
-                    grad_mean, grad_p95,
+                    expected_fields,
+                    expected_fields,
+                    written_fields,
+                    exptime_s,
+                    tile_size_px,
+                    nx,
+                    ny,
+                    clipped_fraction_mean,
+                    None,
+                    utc_now(),
+                    bkg2d_median,
+                    bkg2d_min,
+                    bkg2d_max,
+                    bkg2d_range,
+                    p95_minus_p5,
+                    bkg2d_rms,
+                    slope_x,
+                    slope_y,
+                    slope_mag,
+                    grad_mean,
+                    grad_p95,
                     corner_delta,
-                    bkg2d_median_s, slope_mag_s,
+                    bkg2d_median_s,
+                    slope_mag_s,
                 ),
             )
 
@@ -294,7 +327,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             image_id=int(image_id),
             expected_read=int(expected_fields),
             read=int(expected_fields),
-            expected_written=int(expected_fields),
+            expected_written=0,
             written=int(written_fields),
             status="OK",
             message=None,
@@ -314,7 +347,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 image_id=int(image_id),
                 expected_read=int(expected_fields or 0),
                 read=int(expected_fields or 0),
-                expected_written=int(expected_fields or 0),
+                expected_written=0,
                 written=int(written_fields or 0),
                 status="FAILED",
                 message=f"{type(e).__name__}:{e}",

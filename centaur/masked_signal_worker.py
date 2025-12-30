@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-from astropy.io import fits  # type: ignore
 from astropy.stats import sigma_clip  # type: ignore
 
 from centaur.config import AppConfig
@@ -14,6 +13,9 @@ from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
 from centaur.pipeline import ModuleRunRecord
+
+# Shared pixel loader (FITS + XISF)
+from centaur.io.frame_loader import load_pixels
 
 MODULE_NAME = "masked_signal_worker"
 
@@ -33,6 +35,10 @@ def _safe_float(x: Any) -> Optional[float]:
 
 
 def _flatten(data: Any) -> np.ndarray:
+    """
+    Ensure we end up with a 2D float64 array (or empty array if unsupported).
+    load_pixels() should already return 2D float32, but keep this defensive.
+    """
     arr = np.asarray(data)
     if arr.ndim == 3 and arr.shape[0] == 1:
         arr = arr[0]
@@ -77,12 +83,13 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
 
     image_id: Optional[int] = None
     expected = written = 0
+    fields: Dict[str, Any] = {}
 
     try:
-        with fits.open(event.file_path, memmap=False) as hdul:
-            arr = _flatten(hdul[0].data)
+        # Load pixels (FITS + XISF)
+        arr = _flatten(load_pixels(event.file_path))
         if arr.size == 0:
-            raise ValueError("unsupported_fits_data_shape")
+            raise ValueError("unsupported_image_data_shape")
 
         with Database().transaction() as db:
             image_id = _get_image_id(db, event.file_path)
@@ -130,7 +137,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 else None
             )
 
-            fields: Dict[str, Any] = {
+            fields = {
                 "exptime_s": exptime_s,
                 "nebula_pixel_count": int(nebula.sum()),
                 "bg_pixel_count": int(bg.sum()),
@@ -206,7 +213,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         )
 
         return ModuleRunRecord(
-            image_id=image_id,
+            image_id=int(image_id) if image_id is not None else 0,
             expected_read=expected,
             read=expected,
             expected_written=expected,
@@ -225,7 +232,7 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         )
         if image_id is not None:
             return ModuleRunRecord(
-                image_id=image_id,
+                image_id=int(image_id),
                 expected_read=expected,
                 read=expected,
                 expected_written=expected,

@@ -166,6 +166,73 @@ def _insert_module_run(
     )
 
 
+def _lookup_image_id(db: Database, event: FileReadyEvent) -> Optional[int]:
+    row = db.execute(
+        "SELECT image_id FROM images WHERE file_path = ?",
+        (str(event.file_path),),
+    ).fetchone()
+    return int(row["image_id"]) if row else None
+
+
+def _read_imagetyp_from_db(db: Database, image_id: int) -> str:
+    row = db.execute(
+        "SELECT imagetyp FROM fits_header_core WHERE image_id = ?",
+        (int(image_id),),
+    ).fetchone()
+    if not row:
+        return ""
+    v = row["imagetyp"]
+    return str(v or "").strip().upper()
+
+
+def _coerce_to_run_record(
+    db: Database,
+    event: FileReadyEvent,
+    module_name: str,
+    worker_ret: WorkerReturn,
+    *,
+    started_utc: str,
+    ended_utc: str,
+    duration_us: int,
+    failure_reason: Optional[str],
+) -> Optional[ModuleRunRecord]:
+    """
+    Convert legacy returns (True/False/None) or exceptions into a ModuleRunRecord.
+    - True  -> SKIPPED (not-applicable / legacy success)
+    - False/None -> FAILED
+    Returns None if we cannot resolve image_id.
+    """
+    image_id = _lookup_image_id(db, event)
+    if image_id is None:
+        return None
+
+    if isinstance(worker_ret, ModuleRunRecord):
+        return worker_ret
+
+    if worker_ret is True:
+        return ModuleRunRecord(
+            image_id=int(image_id),
+            expected_read=0,
+            read=0,
+            expected_written=0,
+            written=0,
+            status="SKIPPED",
+            message="legacy_true_return",
+        )
+
+    # False or None
+    msg = failure_reason or "legacy_false_or_none_return"
+    return ModuleRunRecord(
+        image_id=int(image_id),
+        expected_read=0,
+        read=0,
+        expected_written=0,
+        written=0,
+        status="FAILED",
+        message=str(msg),
+    )
+
+
 def _run_one(
     cfg: AppConfig,
     logger: Logger,
@@ -186,17 +253,22 @@ def _run_one(
     started_utc = utc_now()
     start_ns = time.perf_counter_ns()
 
+    worker_ret: WorkerReturn = None
+    failure_reason: Optional[str] = None
+
     try:
         try:
             worker_ret = worker_fn(cfg, logger, event, ctx)
         except TypeError:
             worker_ret = worker_fn(cfg, logger, event)
     except Exception as e:
+        # Log, but ALSO create a failed module_runs row (pipeline owns module_runs).
+        failure_reason = f"{type(e).__name__}:{e}"
         logger.log_failure(
-            module_name,
-            str(event.file_path),
+            module=module_name,
+            file=str(event.file_path),
             action=cfg.on_metric_failure,
-            reason=repr(e),
+            reason=failure_reason,
         )
         worker_ret = None
 
@@ -204,9 +276,9 @@ def _run_one(
     ended_utc = utc_now()
     duration_us = max(0, (end_ns - start_ns) // 1000)
 
+    # If worker returned a proper record, use it.
     if isinstance(worker_ret, ModuleRunRecord):
         expected_fields_db = max(worker_ret.expected_read, worker_ret.expected_written)
-
         with db.transaction() as tx:
             _insert_module_run(
                 tx,
@@ -231,14 +303,52 @@ def _run_one(
             result.ok += 1
         return
 
-    # Migration incomplete or bad return type
+    # Legacy/bad return type: coerce to ModuleRunRecord if possible.
+    coerced = _coerce_to_run_record(
+        db,
+        event,
+        module_name,
+        worker_ret,
+        started_utc=started_utc,
+        ended_utc=ended_utc,
+        duration_us=duration_us,
+        failure_reason=failure_reason or "worker_did_not_return_ModuleRunRecord",
+    )
+
+    if coerced is not None:
+        expected_fields_db = max(coerced.expected_read, coerced.expected_written)
+        with db.transaction() as tx:
+            _insert_module_run(
+                tx,
+                image_id=coerced.image_id,
+                module_name=module_name,
+                expected_fields=expected_fields_db,
+                read_fields=coerced.read,
+                written_fields=coerced.written,
+                status=coerced.status,
+                message=coerced.message,
+                started_utc=started_utc,
+                ended_utc=ended_utc,
+                duration_us=duration_us,
+            )
+
+        if coerced.status == "FAILED":
+            result.failed += 1
+            result.failed_items.append((module_name, str(event.file_path)))
+        elif coerced.status == "SKIPPED":
+            result.skipped += 1
+        else:
+            result.ok += 1
+        return
+
+    # If we couldn't even resolve image_id, treat as failed (but we can't write module_runs).
     result.failed += 1
     result.failed_items.append((module_name, str(event.file_path)))
     logger.log_failure(
         module=module_name,
         file=str(event.file_path),
         action=cfg.on_metric_failure,
-        reason="worker_did_not_return_ModuleRunRecord",
+        reason="worker_failed_and_image_id_unknown",
     )
 
 
@@ -257,21 +367,16 @@ def run_pipeline_for_event(
     if result.failed:
         return result
 
-    # Determine IMAGETYP
-    imagetyp = ""
-    try:
-        from astropy.io import fits
-
-        with fits.open(str(event.file_path), memmap=False) as hdul:
-            imagetyp = str(hdul[0].header.get("IMAGETYP", "")).strip().upper()
-    except Exception:
-        imagetyp = ""
+    # Routing: read IMAGETYP from DB (fits_header_worker already normalized source)
+    image_id = _lookup_image_id(db, event)
+    imagetyp = _read_imagetyp_from_db(db, image_id) if image_id is not None else ""
 
     # FLATS
     if imagetyp == "FLAT":
         _run_one(cfg, logger, event, registry, result, ctx, "flat_group_worker", db)
         _run_one(cfg, logger, event, registry, result, ctx, "flat_basic_worker", db)
 
+        # Explicitly count as skipped for LIGHT-only workers if enabled
         for name in (
             "sky_basic_worker",
             "sky_background2d_worker",

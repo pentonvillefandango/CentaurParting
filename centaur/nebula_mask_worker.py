@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-from astropy.io import fits  # type: ignore
 from astropy.stats import sigma_clip  # type: ignore
 
 from centaur.config import AppConfig
@@ -15,6 +14,9 @@ from centaur.database import Database
 from centaur.logging import Logger
 from centaur.pipeline import ModuleRunRecord
 from centaur.watcher import FileReadyEvent
+
+# Shared pixel loader (FITS + XISF)
+from centaur.io.frame_loader import load_pixels
 
 MODULE_NAME = "nebula_mask_worker"
 
@@ -33,18 +35,6 @@ def _safe_float(x: Any) -> Optional[float]:
         return v
     except Exception:
         return None
-
-
-def _flatten_image_data(data: np.ndarray) -> np.ndarray:
-    if data is None:
-        return np.array([], dtype=np.float64)
-
-    arr = np.asarray(data)
-    if arr.ndim == 3 and arr.shape[0] == 1:
-        arr = arr[0]
-    if arr.ndim != 2:
-        return np.array([], dtype=np.float64)
-    return arr.astype(np.float64, copy=False)
 
 
 def _nan_inf_fractions(arr: np.ndarray) -> Tuple[float, float]:
@@ -103,7 +93,6 @@ def _downsample_mask_nn(mask: np.ndarray, factor: int) -> np.ndarray:
     f = int(factor)
     if f <= 1:
         return mask
-    # keep top-left samples deterministically
     return mask[::f, ::f]
 
 
@@ -119,8 +108,7 @@ def _mask_components_stats(
     - Uses scipy.ndimage.label/find_objects.
     - If downsample_factor > 1, labeling is done on a downsampled mask, and bbox is scaled back.
     - largest_component_frac is defined as (largest component pixels) / (total mask pixels)
-      in the SAME domain used for labeling (i.e., downsampled if enabled). This keeps it
-      stable and easy to interpret (largest share of the mask).
+      in the SAME domain used for labeling (i.e., downsampled if enabled).
     """
     try:
         from scipy.ndimage import find_objects, label  # type: ignore
@@ -132,7 +120,6 @@ def _mask_components_stats(
     f = max(1, int(downsample_factor))
     m = _downsample_mask_nn(mask, f) if f > 1 else mask
 
-    # label connected components
     lab, n = label(m.astype(np.uint8))
     n_i = int(n)
     if n_i <= 0:
@@ -148,7 +135,6 @@ def _mask_components_stats(
     total_mask_px = max(1, total_mask_px)
     largest_frac = float(largest_px) / float(total_mask_px)
 
-    # bbox from find_objects on label image
     sl = find_objects(lab)
     bbox = None
     if sl and len(sl) >= largest_label and sl[largest_label - 1] is not None:
@@ -158,7 +144,6 @@ def _mask_components_stats(
         x0 = int(s[1].start)
         x1 = int(s[1].stop)
 
-        # scale bbox back to original coordinates if downsampled
         if f > 1:
             bbox = {"x0": x0 * f, "y0": y0 * f, "x1": x1 * f, "y1": y1 * f}
         else:
@@ -202,7 +187,6 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
     image_id: Optional[int] = None
     fields: Dict[str, Any] = {}
 
-    # Configurable knobs (with safe defaults)
     threshold_sigma = float(getattr(cfg, "nebula_mask_threshold_sigma", 3.0))
     smooth_sigma_px = float(getattr(cfg, "nebula_mask_smooth_sigma_px", 2.0))
     clip_sigma = float(getattr(cfg, "nebula_mask_bg_clip_sigma", 3.0))
@@ -214,12 +198,16 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         downsample_factor = 1
 
     try:
-        with fits.open(event.file_path, memmap=False) as hdul:
-            data = hdul[0].data
+        px = load_pixels(event.file_path)  # 2D float32 (or luminance proxy)
+        arr2d = np.asarray(px, dtype=np.float64)
 
-        arr2d = _flatten_image_data(data)
-        if arr2d.size == 0:
-            raise ValueError("unsupported_fits_data_shape")
+        # Defensive normalization
+        if arr2d.ndim == 3 and arr2d.shape[0] == 1:
+            arr2d = arr2d[0]
+        if arr2d.ndim != 2 or arr2d.size == 0:
+            raise ValueError(
+                f"unsupported_image_data_shape:{getattr(arr2d, 'shape', None)}"
+            )
 
         nan_fraction, inf_fraction = _nan_inf_fractions(arr2d)
 
@@ -233,14 +221,12 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         if threshold_adu is None:
             raise ValueError("threshold_failed")
 
-        # Smooth (optional) then threshold (SciPy required if smoothing enabled)
         if smooth_sigma_px > 0:
             try:
                 sm = _maybe_gaussian_smooth(arr2d, smooth_sigma_px)
             except Exception as e:
                 if require_scipy:
                     raise
-                # if not required, fall back to unsmoothed
                 logger.log_failure(
                     module=MODULE_NAME,
                     file=str(event.file_path),
@@ -254,13 +240,11 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
 
         mask = np.isfinite(sm) & (sm >= threshold_adu)
 
-        # Aggregate mask stats (full-res)
         total_px = int(arr2d.shape[0]) * int(arr2d.shape[1])
         total_px = max(1, total_px)
         mask_px = int(mask.sum())
         mask_coverage_frac = float(mask_px) / float(total_px)
 
-        # Component stats (optionally downsampled for labeling)
         n_components, largest_component_frac, largest_bbox = _mask_components_stats(
             mask,
             require_scipy=require_scipy,

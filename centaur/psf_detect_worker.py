@@ -8,15 +8,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from astropy.io import fits  # type: ignore
 
 from centaur.config import AppConfig
 from centaur.database import Database
 from centaur.logging import Logger
 from centaur.watcher import FileReadyEvent
-
-# NEW: structured return so pipeline writes module_runs centrally (with duration_us)
 from centaur.pipeline import ModuleRunRecord
+
+# Shared pixel loader (FITS + XISF)
+from centaur.io.frame_loader import load_pixels
 
 MODULE_NAME = "psf_detect_worker"
 
@@ -44,20 +44,9 @@ def _nan_inf_fractions(arr: np.ndarray) -> Tuple[float, float]:
     return nan_count / total, inf_count / total
 
 
-def _flatten_image_data(data: np.ndarray) -> np.ndarray:
-    if data is None:
-        return np.array([], dtype=np.float64)
-
-    arr = np.asarray(data)
-    if arr.ndim == 3 and arr.shape[0] == 1:
-        arr = arr[0]
-    if arr.ndim != 2:
-        return np.array([], dtype=np.float64)
-
-    return arr.astype(np.float64, copy=False)
-
-
-def _central_roi(arr2d: np.ndarray, roi_fraction: float) -> Tuple[np.ndarray, Tuple[int, int]]:
+def _central_roi(
+    arr2d: np.ndarray, roi_fraction: float
+) -> Tuple[np.ndarray, Tuple[int, int]]:
     roi_fraction = float(roi_fraction)
     roi_fraction = max(0.1, min(1.0, roi_fraction))
 
@@ -69,7 +58,9 @@ def _central_roi(arr2d: np.ndarray, roi_fraction: float) -> Tuple[np.ndarray, Tu
     return arr2d[y0 : y0 + rh, x0 : x0 + rw], (x0, y0)
 
 
-def _robust_bg_median_madstd(values_1d: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
+def _robust_bg_median_madstd(
+    values_1d: np.ndarray,
+) -> Tuple[Optional[float], Optional[float]]:
     finite = values_1d[np.isfinite(values_1d)]
     if finite.size == 0:
         return None, None
@@ -99,7 +90,9 @@ class Candidate:
     reject_reason: str
 
 
-def _local_maxima_3x3(img2d: np.ndarray, threshold_adu: float) -> Tuple[np.ndarray, np.ndarray]:
+def _local_maxima_3x3(
+    img2d: np.ndarray, threshold_adu: float
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Return (xs, ys) arrays of 3x3 local maxima above threshold_adu.
     Scales with pixels once; does NOT enumerate all above-threshold pixels.
@@ -125,20 +118,22 @@ def _local_maxima_3x3(img2d: np.ndarray, threshold_adu: float) -> Tuple[np.ndarr
     n7 = pad[2:, 2:]
 
     is_peak = m
-    is_peak &= (center >= n0)
-    is_peak &= (center >= n1)
-    is_peak &= (center >= n2)
-    is_peak &= (center >= n3)
-    is_peak &= (center >= n4)
-    is_peak &= (center >= n5)
-    is_peak &= (center >= n6)
-    is_peak &= (center >= n7)
+    is_peak &= center >= n0
+    is_peak &= center >= n1
+    is_peak &= center >= n2
+    is_peak &= center >= n3
+    is_peak &= center >= n4
+    is_peak &= center >= n5
+    is_peak &= center >= n6
+    is_peak &= center >= n7
 
     ys, xs = np.nonzero(is_peak)
     return xs.astype(np.int32, copy=False), ys.astype(np.int32, copy=False)
 
 
-def _build_peaks(img2d: np.ndarray, *, threshold_adu: float, saturation_adu: Optional[float]) -> List[Peak]:
+def _build_peaks(
+    img2d: np.ndarray, *, threshold_adu: float, saturation_adu: Optional[float]
+) -> List[Peak]:
     xs, ys = _local_maxima_3x3(img2d, threshold_adu)
     if xs.size == 0:
         return []
@@ -146,7 +141,7 @@ def _build_peaks(img2d: np.ndarray, *, threshold_adu: float, saturation_adu: Opt
     vals = img2d[ys, xs].astype(np.float64, copy=False)
 
     if saturation_adu is not None and np.isfinite(saturation_adu):
-        sat = (vals >= float(saturation_adu))
+        sat = vals >= float(saturation_adu)
     else:
         sat = None
 
@@ -279,7 +274,68 @@ def _get_image_id(db: Database, file_path: Path) -> Optional[int]:
     return int(row["image_id"]) if row else None
 
 
-def _maybe_dump_candidates_csv(cfg: AppConfig, image_id: int, file_path: Path, candidates: List[Candidate]) -> None:
+def _derive_saturation_adu_from_fits_encoding(
+    *,
+    bitpix: Optional[int],
+    bzero: Optional[float],
+    bscale: Optional[float],
+) -> Optional[float]:
+    """
+    Derive an ADU ceiling from FITS storage encoding.
+
+    Uses FITS scaling: physical = raw * BSCALE + BZERO.
+    """
+    if bitpix is None:
+        return None
+
+    bz = 0.0 if bzero is None else float(bzero)
+    bs = 1.0 if bscale is None else float(bscale)
+
+    if not np.isfinite(bz) or not np.isfinite(bs) or bs == 0.0:
+        return None
+
+    if bitpix == 16:
+        raw_max = 32767.0
+    elif bitpix == 8:
+        raw_max = 255.0
+    elif bitpix == 32:
+        raw_max = 2147483647.0
+    else:
+        return None
+
+    ceiling = raw_max * bs + bz
+    if not np.isfinite(ceiling) or ceiling <= 0:
+        return None
+    return float(ceiling)
+
+
+def _get_saturation_hint_from_db(db: Database, image_id: int) -> Optional[float]:
+    """
+    Prefer DATAMAX from header core; fallback derive from BITPIX/BZERO/BSCALE.
+    Works for both FITS and XISF (fits_header_worker stores these for XISF too, if present).
+    """
+    row = db.execute(
+        "SELECT datamax, bitpix, bzero, bscale FROM fits_header_core WHERE image_id = ?",
+        (int(image_id),),
+    ).fetchone()
+    if not row:
+        return None
+
+    datamax = _safe_float(row["datamax"])
+    if datamax is not None:
+        return datamax
+
+    bitpix = row["bitpix"]
+    bzero = _safe_float(row["bzero"])
+    bscale = _safe_float(row["bscale"])
+    return _derive_saturation_adu_from_fits_encoding(
+        bitpix=bitpix, bzero=bzero, bscale=bscale
+    )
+
+
+def _maybe_dump_candidates_csv(
+    cfg: AppConfig, image_id: int, file_path: Path, candidates: List[Candidate]
+) -> None:
     if not getattr(cfg, "psf_debug_dump_candidates_csv", False):
         return
 
@@ -289,9 +345,29 @@ def _maybe_dump_candidates_csv(cfg: AppConfig, image_id: int, file_path: Path, c
     out_path = out_dir / f"{image_id}_{file_path.stem}.candidates.csv"
     with out_path.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["x", "y", "peak_adu", "saturated", "edge_rejected", "rejected", "reject_reason"])
+        w.writerow(
+            [
+                "x",
+                "y",
+                "peak_adu",
+                "saturated",
+                "edge_rejected",
+                "rejected",
+                "reject_reason",
+            ]
+        )
         for c in candidates:
-            w.writerow([c.x, c.y, f"{c.value:.3f}", int(c.saturated), int(c.edge_rejected), int(c.rejected), c.reject_reason])
+            w.writerow(
+                [
+                    c.x,
+                    c.y,
+                    f"{c.value:.3f}",
+                    int(c.saturated),
+                    int(c.edge_rejected),
+                    int(c.rejected),
+                    c.reject_reason,
+                ]
+            )
 
 
 def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) -> Any:
@@ -311,13 +387,17 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
     image_id: Optional[int] = None
 
     try:
-        with fits.open(str(event.file_path), memmap=False) as hdul:
-            hdr = hdul[0].header
-            data = hdul[0].data
+        # Load pixels (FITS + XISF)
+        px = load_pixels(event.file_path)  # should be 2D float32
+        img2d = np.asarray(px, dtype=np.float64)
 
-        img2d = _flatten_image_data(data)
-        if img2d.size == 0:
-            raise ValueError("unsupported_fits_data_shape")
+        # Defensive normalization
+        if img2d.ndim == 3 and img2d.shape[0] == 1:
+            img2d = img2d[0]
+        if img2d.ndim != 2 or img2d.size == 0:
+            raise ValueError(
+                f"unsupported_image_data_shape:{getattr(img2d, 'shape', None)}"
+            )
 
         nan_fraction, inf_fraction = _nan_inf_fractions(img2d)
 
@@ -339,9 +419,17 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 good_threshold_adu = bg_median + 100.0
             else:
                 threshold_adu = bg_median + threshold_sigma * bg_madstd
-                good_threshold_adu = bg_median + (threshold_sigma + good_extra_sigma) * bg_madstd
+                good_threshold_adu = (
+                    bg_median + (threshold_sigma + good_extra_sigma) * bg_madstd
+                )
 
-        saturation_adu = _safe_float(hdr.get("SATURATE", None))
+        # saturation hint from DB (works for XISF too)
+        saturation_adu: Optional[float] = None
+        with Database().transaction() as db:
+            image_id = _get_image_id(db, event.file_path)
+            if image_id is None:
+                raise RuntimeError("image_id_not_found_for_file_path")
+            saturation_adu = _get_saturation_hint_from_db(db, int(image_id))
 
         candidates: List[Candidate] = []
         n_peaks_total = 0
@@ -350,7 +438,11 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
         n_saturated_candidates = 0
 
         if threshold_adu is not None and good_threshold_adu is not None:
-            peaks = _build_peaks(roi2d, threshold_adu=float(threshold_adu), saturation_adu=saturation_adu)
+            peaks = _build_peaks(
+                roi2d,
+                threshold_adu=float(threshold_adu),
+                saturation_adu=saturation_adu,
+            )
 
             if max_stars > 0 and len(peaks) > max_stars:
                 peaks = peaks[:max_stars]
@@ -416,16 +508,24 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
             "inf_fraction": inf_fraction,
             "usable": usable,
             "reason": reason,
+            # not stored, but useful for debugging
+            "saturation_adu": saturation_adu,
         }
 
-        expected_fields = len(fields)
+        # DB schema doesn't include saturation_adu in psf_detect_metrics; don't count it.
+        fields_for_db = dict(fields)
+        fields_for_db.pop("saturation_adu", None)
+
+        expected_fields = len(fields_for_db)
         read_fields = expected_fields
-        written_fields = sum(1 for v in fields.values() if v is not None)
+        written_fields = sum(1 for v in fields_for_db.values() if v is not None)
 
         with Database().transaction() as db:
-            image_id = _get_image_id(db, event.file_path)
-            if image_id is None:
+            # image_id already known above, but re-fetching is cheap; keep deterministic behavior
+            image_id2 = _get_image_id(db, event.file_path)
+            if image_id2 is None:
                 raise RuntimeError("image_id_not_found_for_file_path")
+            image_id = int(image_id2)
 
             db.execute(
                 """
@@ -453,14 +553,31 @@ def process_file_event(cfg: AppConfig, logger: Logger, event: FileReadyEvent) ->
                 """,
                 (
                     image_id,
-                    expected_fields, read_fields, written_fields,
-                    None, utc_now(),
-                    roi_fraction, threshold_sigma, min_separation_px, max_stars,
-                    fields["bg_median_adu"], fields["bg_madstd_adu"], fields["threshold_adu"],
-                    n_total, n_used, n_saturated_candidates, n_edge_rejected,
-                    nan_fraction, inf_fraction,
-                    usable, reason,
-                    n_peaks_total, n_peaks_good, peak_window, good_extra_sigma, fields["good_threshold_adu"],
+                    expected_fields,
+                    read_fields,
+                    written_fields,
+                    None,
+                    utc_now(),
+                    roi_fraction,
+                    threshold_sigma,
+                    min_separation_px,
+                    max_stars,
+                    fields_for_db["bg_median_adu"],
+                    fields_for_db["bg_madstd_adu"],
+                    fields_for_db["threshold_adu"],
+                    n_total,
+                    n_used,
+                    n_saturated_candidates,
+                    n_edge_rejected,
+                    nan_fraction,
+                    inf_fraction,
+                    usable,
+                    reason,
+                    n_peaks_total,
+                    n_peaks_good,
+                    peak_window,
+                    good_extra_sigma,
+                    fields_for_db["good_threshold_adu"],
                 ),
             )
 

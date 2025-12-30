@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import threading
@@ -17,6 +16,7 @@ class FileReadyEvent:
     """
     Emitted when a file is considered stable and ready for processing.
     """
+
     file_path: Path
     watch_root_label: str
     watch_root_path: Path
@@ -38,7 +38,7 @@ class Watcher:
     - DOES NOT write to DB
     """
 
-    DEFAULT_FITS_EXTS = {".fits", ".fit", ".fts"}
+    DEFAULT_FITS_EXTS = {".fits", ".fit", ".fts", ".xisf"}
 
     def __init__(
         self,
@@ -150,7 +150,9 @@ class Watcher:
             self._seen.add(file_path)
 
             try:
-                stable = self._wait_until_stable(file_path, stability_window=stability_window)
+                stable = self._wait_until_stable(
+                    file_path, stability_window=stability_window
+                )
             except FileNotFoundError:
                 continue
             except PermissionError as e:
